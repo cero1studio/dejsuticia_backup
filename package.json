@@ -1,0 +1,148 @@
+{
+  "name": "podio-backup",
+  "version": "0.1.0",
+  "private": true,
+  "main": "main.js",
+  "description": "Respaldo automatizado de archivos y Excels oficiales de Podio.",
+  "author": "CeroUno SAs",
+  "scripts": {
+    "build": "next build && electron-builder",
+    "build:win": "next build && electron-builder --win --x64",
+    "build:win:portable": "next build && electron-builder --win portable --x64",
+    "build:mac": "next build && electron-builder --mac",
+    "build:all": "next build && electron-builder --win --mac",
+    "dev": "next dev",
+    "electron": "electron .",
+    "electron-dev": "concurrently \"npm run dev\" \"wait-on http://localhost:3000 && electron .\"",
+    "postinstall": "electron-rebuild",
+    "lint": "next lint",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@hookform/resolvers": "^3.9.1",
+    "@radix-ui/react-accordion": "1.2.2",
+    "@radix-ui/react-alert-dialog": "1.1.4",
+    "@radix-ui/react-aspect-ratio": "1.1.1",
+    "@radix-ui/react-avatar": "1.1.2",
+    "@radix-ui/react-checkbox": "latest",
+    "@radix-ui/react-collapsible": "1.1.2",
+    "@radix-ui/react-context-menu": "2.2.4",
+    "@radix-ui/react-dialog": "1.1.4",
+    "@radix-ui/react-dropdown-menu": "2.1.4",
+    "@radix-ui/react-hover-card": "1.1.4",
+    "@radix-ui/react-label": "2.1.1",
+    "@radix-ui/react-menubar": "1.1.4",
+    "@radix-ui/react-navigation-menu": "1.2.3",
+    "@radix-ui/react-popover": "1.1.4",
+    "@radix-ui/react-progress": "latest",
+    "@radix-ui/react-radio-group": "1.2.2",
+    "@radix-ui/react-scroll-area": "1.2.2",
+    "@radix-ui/react-select": "2.1.4",
+    "@radix-ui/react-separator": "1.1.1",
+    "@radix-ui/react-slider": "1.2.2",
+    "@radix-ui/react-slot": "1.1.1",
+    "@radix-ui/react-switch": "1.1.2",
+    "@radix-ui/react-tabs": "latest",
+    "@radix-ui/react-toast": "1.2.4",
+    "@radix-ui/react-toggle": "1.1.1",
+    "@radix-ui/react-toggle-group": "1.1.1",
+    "@radix-ui/react-tooltip": "1.1.6",
+    "autoprefixer": "^10.4.20",
+    "better-sqlite3": "^11.10.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "cmdk": "1.0.4",
+    "date-fns": "4.1.0",
+    "electron-dl": "latest",
+    "electron-is-dev": "latest",
+    "embla-carousel-react": "8.5.1",
+    "fs": "latest",
+    "input-otp": "1.4.1",
+    "lucide-react": "^0.454.0",
+    "next": "15.2.4",
+    "next-themes": "latest",
+    "path": "latest",
+    "react": "^19",
+    "react-datepicker": "latest",
+    "react-day-picker": "8.10.1",
+    "react-dom": "^19",
+    "react-hook-form": "^7.54.1",
+    "react-resizable-panels": "^2.1.7",
+    "recharts": "2.15.0",
+    "sonner": "^1.7.1",
+    "tailwind-merge": "^2.5.5",
+    "tailwindcss-animate": "^1.0.7",
+    "vaul": "^0.9.6",
+    "xlsx": "^0.18.5",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "concurrently": "^8.2.2",
+    "electron": "^37.8.0",
+    "electron-builder": "^26.0.12",
+    "electron-rebuild": "^3.2.9",
+    "postcss": "^8.5",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5",
+    "wait-on": "^7.2.0"
+  },
+  "build": {
+    "appId": "com.cerouno.podiobackup",
+    "productName": "Podio Backup",
+    "files": [
+      "app/**/*",
+      "main.js",
+      "preload.js",
+      "package.json",
+      "public/**/*",
+      "main/**/*",
+      "lib/**/*",
+      ".next/**/*",
+      "!node_modules/@types/**/*",
+      "!node_modules/**/*.{iml,o,hprof,orig,pyc,pyo,rbc,swp,csproj,sln,xproj}",
+      "!node_modules/.bin",
+      "!node_modules/**/{test,__tests__,tests,powered-test,example,examples}",
+      "!node_modules/**/{*.md,*.MD,CHANGELOG,LICENSE,LICENCE,README,Readme,readme}",
+      "!node_modules/**/.{bin,buildin,coverage,docker,grunt,istanbul,mocha,nyc}",
+      "node_modules/better-sqlite3/**/*"
+    ],
+    "asarUnpack": [
+      "**/better-sqlite3/**/*"
+    ],
+    "npmRebuild": false,
+    "beforePack": null,
+    "extraMetadata": {
+      "main": "main.js"
+    },
+    "directories": {
+      "buildResources": "assets",
+      "output": "dist"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "${productName}-${version}-x64.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Podio Backup"
+    },
+    "mac": {
+      "target": "dmg",
+      "icon": "public/placeholder-logo.png",
+      "category": "public.app-category.productivity"
+    }
+  }
+}
