@@ -250,8 +250,8 @@ export class PodioBackupService {
     // Logs de inicialización solo en modo desarrollo o si se solicita explícitamente
     // Reducir logs repetitivos en producción
     if (process.env.NODE_ENV === 'development') {
-      this.addLog("info", "Servicio de respaldo de Podio inicializado")
-      this.addLog("info", `Ruta de respaldo configurada: ${this.backupPath}`)
+    this.addLog("info", "Servicio de respaldo de Podio inicializado")
+    this.addLog("info", `Ruta de respaldo configurada: ${this.backupPath}`)
       this.addLog("info", `API URL configurada: ${this.baseUrl}`)
     } else {
       // En producción, solo loguear si hay algún problema
@@ -609,11 +609,11 @@ export class PodioBackupService {
           if (this.activeRateLimit) {
             const waitTime = Math.ceil((this.activeRateLimit.resetTime - Date.now()) / 1000)
             if (waitTime > 0) {
-              this.addLog(
-                "warning",
+            this.addLog(
+              "warning",
                 `LÃ­mite de tasa activo (${this.activeRateLimit.type}). Esperando ${waitTime} segundos...`,
-              )
-              throw new Error(`RATE_LIMIT_ERROR:${waitTime}:${this.activeRateLimit.type}`)
+            )
+            throw new Error(`RATE_LIMIT_ERROR:${waitTime}:${this.activeRateLimit.type}`)
             } else {
               // Si el tiempo ya expiró, limpiar el rate limit
               this.activeRateLimit = null
@@ -739,6 +739,46 @@ export class PodioBackupService {
       this.rateLimits[limitType].limit = parseInt(limit)
       this.rateLimits[limitType].remaining = parseInt(remaining)
       this.addLog("info", `Rate limit ${limitType}: ${remaining}/${limit} restantes`)
+    }
+    
+    // Registrar la llamada en BD si está disponible (para llamadas directas con fetch)
+    // Esto asegura que llamadas fuera de apiRequest también se registren
+    if (typeof window !== 'undefined' && window.electron && window.electron.db) {
+      const contentLength = headers.get('Content-Length')
+      const responseBytes = contentLength ? parseInt(contentLength, 10) : undefined
+      // No esperar, hacer asíncrono
+      this.logApiRequest(method, endpoint, limitType, 200, responseBytes).catch(() => {
+        // Ignorar errores de registro silenciosamente
+      })
+    }
+  }
+
+  /**
+   * Registrar una llamada API en la base de datos (asíncrono, no bloquea)
+   */
+  private async logApiRequest(
+    method: string,
+    endpoint: string,
+    rateType: 'general' | 'rateLimited',
+    status: number,
+    bytes?: number,
+    meta?: any
+  ): Promise<void> {
+    try {
+      if (typeof window !== 'undefined' && window.electron && window.electron.db) {
+        await window.electron.db.logRequest({
+          method,
+          endpoint,
+          rate_type: rateType,
+          status,
+          bytes,
+          meta
+        })
+      }
+    } catch (error) {
+      // Ignorar errores de registro silenciosamente para no bloquear el flujo principal
+      // Solo loguear en consola para debugging
+      console.warn('Error registrando llamada API en BD:', error)
     }
   }
 
@@ -868,10 +908,13 @@ export class PodioBackupService {
   ): Promise<{
     workspaces: any[];
     applications: any[];
-    items: any[];
+    itemsCount: number;
     files: PodioFile[];
   }> {
-    this.addLog("info", `ðŸ¢ Procesando organizaciÃ³n: ${org.name}`);
+    const orgCounter = orgIndex !== undefined && orgTotal !== undefined 
+      ? `[Org ${orgIndex + 1}/${orgTotal}]` 
+      : '';
+    this.addLog("info", `🏢 ${orgCounter} Procesando organización: ${org.name}`);
     
     const workspaces = await this.retryWithBackoff(
       () => this.getWorkspaces(org.org_id),
@@ -880,19 +923,20 @@ export class PodioBackupService {
       `obtener espacios de trabajo de ${org.name}`
     );
     
-    this.addLog("info", `ðŸ“ Espacios encontrados en ${org.name}: ${workspaces.length}`);
+    this.addLog("info", `📁 ${orgCounter} Espacios encontrados en "${org.name}": ${workspaces.length}`);
+    this.addLog("info", `📚 ${orgCounter} Contadores actuales: ${this.backupCounts.workspaces} workspaces, ${this.backupCounts.applications} apps, ${this.backupCounts.items} items, ${this.backupCounts.files} archivos`);
     
     // Procesar espacios de trabajo en paralelo
     const workspacePromises = workspaces.map(workspace => 
       this.processWorkspaceParallel(workspace, progressCallback, org, scanOnly)
     );
     
-    this.addLog("info", `âš¡ Procesando ${workspaces.length} espacios en paralelo...`);
+    this.addLog("info", `⚡ ${orgCounter} Procesando ${workspaces.length} espacios en paralelo...`);
     const workspaceResults = await Promise.all(workspacePromises);
     
     // Consolidar resultados
     const allApplications = workspaceResults.flatMap(result => result.applications);
-    const allItems = workspaceResults.flatMap(result => result.items);
+    const totalItemsCount = workspaceResults.reduce((sum, result) => sum + result.itemsCount, 0);
     const allFiles = workspaceResults.flatMap(result => result.files);
     
     // Actualizar contadores de workspaces
@@ -902,20 +946,20 @@ export class PodioBackupService {
     // Actualizar progreso con contadores actualizados
     if (progressCallback && orgTotal && orgIndex !== undefined) {
       const progress = Math.min(95, 1 + ((orgIndex / orgTotal) * 94));
-      const status = `Escaneando... (${this.backupCounts.workspaces} workspaces, ${this.backupCounts.applications} apps, ${this.backupCounts.items} items, ${this.backupCounts.files} archivos)`;
+      const status = `Org ${orgIndex + 1}/${orgTotal}: ${org.name} | Workspaces: ${this.backupCounts.workspaces} | Apps: ${this.backupCounts.applications} | Items: ${this.backupCounts.items} | Archivos: ${this.backupCounts.files}`;
       this.updateProgress(progress, status, progressCallback);
     }
     
-    this.addLog("success", `âœ… OrganizaciÃ³n ${org.name} completada:`);
-    this.addLog("info", `   ðŸ“ Espacios: ${workspaces.length}`);
-    this.addLog("info", `   ðŸ“± Aplicaciones: ${allApplications.length}`);
-    this.addLog("info", `   ðŸ“„ Items: ${allItems.length}`);
-    this.addLog("info", `   ðŸ“Ž Archivos: ${allFiles.length}`);
+    this.addLog("success", `✅ ${orgCounter} Organización "${org.name}" completada:`);
+    this.addLog("info", `   📁 Espacios: ${workspaces.length}`);
+    this.addLog("info", `   📱 Aplicaciones: ${allApplications.length}`);
+    this.addLog("info", `   📄 Items: ${totalItemsCount}`);
+    this.addLog("info", `   📎 Archivos: ${allFiles.length}`);
     
     return {
       workspaces,
       applications: allApplications,
-      items: allItems,
+      itemsCount: totalItemsCount,
       files: allFiles
     };
   }
@@ -935,10 +979,10 @@ export class PodioBackupService {
    */
   protected async processWorkspaceParallel(workspace: any, progressCallback?: ProgressCallback, org?: any, scanOnly?: boolean): Promise<{
     applications: any[];
-    items: any[];
+    itemsCount: number;
     files: PodioFile[];
   }> {
-    this.addLog("info", `Procesando espacio de trabajo en paralelo: ${workspace.name}`);
+    this.addLog("info", `📁 Procesando espacio de trabajo: ${workspace.name}`);
     
     const applications = await this.retryWithBackoff(
       () => this.getApplications(workspace.space_id),
@@ -947,28 +991,35 @@ export class PodioBackupService {
       `obtener aplicaciones de ${workspace.name}`
     );
     
+    this.addLog("info", `📱 Espacio "${workspace.name}": ${applications.length} aplicaciones encontradas`);
+    this.addLog("info", `📚 Contadores actuales: ${this.backupCounts.workspaces} workspaces, ${this.backupCounts.applications} apps, ${this.backupCounts.items} items, ${this.backupCounts.files} archivos`);
+    
     // Procesar aplicaciones en paralelo (limitado para evitar sobrecarga)
-    const maxConcurrentApps = 3; // Procesar mÃ¡ximo 3 apps en paralelo
-    const allItems: any[] = [];
+    const maxConcurrentApps = 3; // Procesar máximo 3 apps en paralelo
+    let totalItemsCount = 0;
     const allFiles: PodioFile[] = [];
+    const totalApps = applications.length;
     
     for (let i = 0; i < applications.length; i += maxConcurrentApps) {
       const appBatch = applications.slice(i, i + maxConcurrentApps);
-      const appPromises = appBatch.map(app => 
-        this.processApplicationParallel(app, progressCallback, org, workspace, scanOnly)
-      );
+      const appPromises = appBatch.map((app, batchIndex) => {
+        const appIndex = i + batchIndex;
+        return this.processApplicationParallel(app, progressCallback, org, workspace, scanOnly, appIndex, totalApps);
+      });
       
       const appResults = await Promise.all(appPromises);
       
       appResults.forEach(result => {
-        allItems.push(...result.items);
+        totalItemsCount += result.itemsCount;
         allFiles.push(...result.files);
       });
     }
     
+    this.addLog("success", `✅ Espacio "${workspace.name}" completado: ${applications.length} apps, ${totalItemsCount} items, ${allFiles.length} archivos`);
+    
     return {
       applications,
-      items: allItems,
+      itemsCount: totalItemsCount,
       files: allFiles
     };
   }
@@ -992,11 +1043,25 @@ export class PodioBackupService {
    * - Actualiza progreso constantemente con indicadores numéricos en tiempo real
    * - Usa /file/app/{app_id}/ para obtener archivos (optimizado, no itera por items)
    */
-  protected async processApplicationParallel(app: any, progressCallback?: ProgressCallback, org?: any, workspace?: any, scanOnly?: boolean): Promise<{
-    items: any[];
+  protected async processApplicationParallel(
+    app: any, 
+    progressCallback?: ProgressCallback, 
+    org?: any, 
+    workspace?: any, 
+    scanOnly?: boolean,
+    appIndex?: number,
+    totalApps?: number
+  ): Promise<{
+    itemsCount: number;
     files: PodioFile[];
   }> {
-    this.addLog("info", `Procesando aplicación en paralelo: ${app.name}`);
+    const appCounter = appIndex !== undefined && totalApps !== undefined 
+      ? `[App ${appIndex + 1}/${totalApps}]` 
+      : '';
+    this.addLog("warning", `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    this.addLog("warning", `📱 ${appCounter} PROCESANDO APLICACIÓN: ${app.name}`);
+    this.addLog("warning", `📱 ${appCounter} scanOnly recibido: ${scanOnly} (debe ser false para descargar Excel)`);
+    this.addLog("warning", `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
     
     // SIEMPRE crear carpeta para la app, incluso si no tiene archivos
     // IMPORTANTE: Verificar que backupTimestamp esté generado antes de crear carpetas
@@ -1011,9 +1076,10 @@ export class PodioBackupService {
     let folderPath: string | null = null;
     if (org && workspace && typeof window !== 'undefined' && window.electron) {
       try {
+        this.addLog("info", `📁 ${appCounter} Creando carpeta para: ${app.name}`);
         // createFolderStructure está sobrescrito en podio-service-electron.ts y usa backupTimestamp
         folderPath = await this.createFolderStructure(org.name, workspace.name, app.name);
-        this.addLog("success", `📁 Carpeta creada: ${folderPath}`);
+        this.addLog("success", `📁 ${appCounter} Carpeta creada: ${folderPath}`);
       } catch (error) {
         this.addLog("error", `❌ Error crítico creando carpeta para ${app.name}: ${error instanceof Error ? error.message : String(error)}`);
         // CRÍTICO: Si falla la creación de carpeta, intentar crear una ruta alternativa o reintentar
@@ -1054,12 +1120,13 @@ export class PodioBackupService {
       }
     }
     
-    // PASO 2: Obtener items y archivos para el conteo y guardado en BD
-    const items = await this.retryWithBackoff(
-      () => this.getItems(app.app_id),
+    // PASO 2: Obtener conteo de items y archivos para el conteo y guardado en BD
+    // OPTIMIZACIÓN: Solo obtener el conteo de items (1 llamada API) en lugar de todos los items (N llamadas)
+    const itemsCount = await this.retryWithBackoff(
+      () => this.getItemsCount(app.app_id),
       3,
       1000,
-      `obtener items de ${app.name}`
+      `obtener conteo de items de ${app.name}`
     );
     
     // OPTIMIZACIÓN: Usar /file/app/{app_id}/ para obtener todos los archivos de una vez
@@ -1067,18 +1134,25 @@ export class PodioBackupService {
     this.addLog("info", `📥 [${app.name}] Obteniendo archivos de la app (app_id: ${app.app_id})...`);
     const allFiles = await this.retryWithBackoff(
       () => this.getAppFiles(app.app_id),
-      3,
-      1000,
+          3,
+          1000,
       `obtener archivos de ${app.name}`
     );
-    this.addLog("info", `📊 [${app.name}] Datos obtenidos: ${items.length} items, ${allFiles.length} archivos`);
+    this.addLog("info", `📊 [${app.name}] Datos obtenidos: ${itemsCount} items, ${allFiles.length} archivos`);
+    
+    // Log resumen del proceso de archivos
+    this.addLog("warning", `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    this.addLog("warning", `📋 ${appCounter} PROCESANDO ARCHIVOS PARA APP: ${app.name}`);
+    this.addLog("warning", `📋 ${appCounter} Comprobando archivos para app (${allFiles.length} archivos encontrados)`);
+    this.addLog("warning", `📋 ${appCounter} Si existen archivos: creando carpeta files, guardando rutas de descarga de archivos en base de datos`);
+    this.addLog("warning", `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
     
     // Actualizar contadores INMEDIATAMENTE después de obtener datos
     this.backupCounts.applications++;
-    this.backupCounts.items += items.length;
+    this.backupCounts.items += itemsCount;
     this.backupCounts.files += allFiles.length;
     this.backupStats.apps++;
-    this.backupStats.items += items.length;
+    this.backupStats.items += itemsCount;
     this.backupStats.files += allFiles.length;
     
     // Calcular tamaño total
@@ -1092,9 +1166,8 @@ export class PodioBackupService {
     // CRÍTICO: El Excel se descarga ANTES de crear la carpeta files
     // IMPORTANTE: TODAS las apps deben descargar Excel, incluso si no tienen items
     // El Excel puede estar vacío, pero debe descargarse
-    this.addLog("info", `🔍 [${app.name}] LLEGÓ A PASO 3: Descargar Excel. folderPath=${folderPath}, scanOnly=${scanOnly}, electron=${typeof window !== 'undefined' && !!window.electron}`);
-    this.addLog("info", `🔍 [${app.name}] Verificando condiciones para descargar Excel: folderPath=${!!folderPath}, scanOnly=${scanOnly}, electron=${typeof window !== 'undefined' && !!window.electron}`);
-    this.addLog("info", `🔍 [${app.name}] DEBUG - Tipo de scanOnly: ${typeof scanOnly}, Valor: ${scanOnly}, Negación: ${!scanOnly}`);
+    const excelFileName = `${this.sanitizeFileName(app.name)}_oficial.xlsx`;
+    const excelPath = folderPath ? `${folderPath}/${excelFileName}` : null;
     
     // CRÍTICO: Si folderPath es null pero tenemos org y workspace, intentar construir la ruta
     if (!folderPath && org && workspace && typeof window !== 'undefined' && window.electron) {
@@ -1114,38 +1187,96 @@ export class PodioBackupService {
       }
     }
     
-    if (folderPath && !scanOnly && typeof window !== 'undefined' && window.electron) {
+    // CRÍTICO: Verificar condiciones ANTES de intentar descargar
+    // LOGS MUY VISIBLES para debugging
+    this.addLog("warning", `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    this.addLog("warning", `🔍 [${app.name}] ========== EVALUACIÓN PARA DESCARGAR EXCEL ==========`);
+    this.addLog("warning", `   📁 folderPath existe: ${!!folderPath} (${folderPath || 'null'})`);
+    this.addLog("warning", `   🔄 scanOnly: ${scanOnly} (debe ser false para descargar)`);
+    this.addLog("warning", `   ⚡ Electron disponible: ${typeof window !== 'undefined' && !!window.electron}`);
+    this.addLog("warning", `   📊 App ID: ${app.app_id}`);
+    this.addLog("warning", `   📄 Archivo Excel: ${excelFileName}`);
+    this.addLog("warning", `   📂 Ruta completa: ${excelPath || 'N/A'}`);
+    
+    const canDownloadExcel = folderPath && !scanOnly && typeof window !== 'undefined' && window.electron;
+    this.addLog("warning", `   ✅ RESULTADO FINAL: ${canDownloadExcel ? '✅✅✅ SÍ PUEDE DESCARGAR EXCEL ✅✅✅' : '❌❌❌ NO PUEDE DESCARGAR EXCEL ❌❌❌'}`);
+    this.addLog("warning", `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    
+    if (canDownloadExcel) {
       try {
-        this.addLog("info", `📊 [${app.name}] INICIANDO descarga de Excel de items (app_id: ${app.app_id})...`);
-        this.addLog("info", `📊 [${app.name}] Total de items a exportar: ${items.length}`);
-        this.addLog("info", `📊 [${app.name}] Llamando a downloadAppExcel con: appId=${app.app_id}, folderPath=${folderPath}, appName=${app.name}`);
-        await this.downloadAppExcel(app.app_id, folderPath, app.name, progressCallback);
-        this.addLog("success", `✅ [${app.name}] Excel descargado exitosamente en: ${folderPath}`);
+        this.addLog("warning", `🚀🚀🚀 INICIANDO DESCARGA DE EXCEL PARA: ${app.name} 🚀🚀🚀`);
+        this.addLog("warning", `📊 ${appCounter} Descargando Excel para: ${app.name}`);
+        this.addLog("warning", `📁 ${appCounter} Carpeta: ${folderPath}`);
+        this.addLog("warning", `📊 ${appCounter} Archivo: ${excelFileName}`);
+        this.addLog("warning", `📊 ${appCounter} Total de items a exportar: ${itemsCount}`);
+        this.addLog("warning", `📊 ${appCounter} Llamando a downloadAppExcel ahora...`);
+        
+        const excelStartTime = Date.now();
+        await this.downloadAppExcel(app.app_id, folderPath!, app.name, progressCallback, appIndex, totalApps);
+        const excelEndTime = Date.now();
+        const excelDuration = ((excelEndTime - excelStartTime) / 1000).toFixed(2);
+        
+        this.addLog("success", `✅✅✅ ${appCounter} EXCEL DESCARGADO EXITOSAMENTE: ${app.name} (${excelDuration}s) ✅✅✅`);
+        this.addLog("success", `📁 ${appCounter} Archivo guardado en: ${excelPath}`);
       } catch (error) {
-        // Si es rate limit, propagar el error para que se maneje en el nivel superior
+        // CRÍTICO: Si es rate limit, propagar el error para que se maneje en el nivel superior (pausa automática)
         if (error instanceof Error && error.message.startsWith("RATE_LIMIT_ERROR:")) {
-          this.addLog("warning", `⏸️ [${app.name}] Rate limit detectado al descargar Excel. Se reintentará después.`);
-          throw error; // Propagar para manejo de rate limit
+          this.addLog("warning", `⏸️ [${app.name}] Rate limit detectado al descargar Excel. Se pausará y reintentará automáticamente.`);
+          throw error; // Propagar para manejo de rate limit con pausa automática
         }
-        this.addLog("error", `❌ [${app.name}] Error descargando Excel: ${error instanceof Error ? error.message : String(error)}`);
-        this.addLog("error", `❌ [${app.name}] Stack trace: ${error instanceof Error ? error.stack : 'N/A'}`);
-        // No lanzar el error para no detener el proceso completo, solo loguearlo
-        // El Excel se puede descargar después durante el backup
+        // CRÍTICO: Si es cancelación, propagar
+        if (error instanceof Error && error.message.startsWith("ESCANEO_CANCELADO:")) {
+          this.addLog("warning", `🚫 [${app.name}] Escaneo cancelado durante descarga de Excel`);
+          throw error; // Propagar cancelación
+        }
+        // CRÍTICO: Para TODOS los demás errores, lanzar para PAUSAR el proceso
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        const errorStack = error instanceof Error ? error.stack : 'N/A';
+        this.addLog("error", `❌ [${app.name}] ========== ERROR DESCARGANDO EXCEL ==========`);
+        this.addLog("error", `❌ [${app.name}] Mensaje: ${errorMessage}`);
+        this.addLog("error", `❌ [${app.name}] Stack: ${errorStack}`);
+        this.addLog("error", `❌ [${app.name}] App ID: ${app.app_id}`);
+        this.addLog("error", `❌ [${app.name}] Folder Path: ${folderPath}`);
+        this.addLog("error", `❌ [${app.name}] Items Count: ${itemsCount}`);
+        this.addLog("error", `❌ [${app.name}] ===============================================`);
+        this.addLog("error", `❌ [${app.name}] El proceso se PAUSARÁ porque la descarga de Excel falló`);
+        
+        // Lanzar error para detener el proceso
+        throw error;
       }
     } else {
+      // Log detallado de por qué NO se puede descargar - MUY VISIBLE
+      this.addLog("error", `❌❌❌ [${app.name}] ========== NO SE PUEDE DESCARGAR EXCEL ========== ❌❌❌`);
       if (!folderPath) {
-        this.addLog("error", `❌ [${app.name}] No se puede descargar Excel: carpeta no creada (folderPath es null)`);
+        this.addLog("error", `❌ [${app.name}] RAZÓN: folderPath es null`);
+        this.addLog("error", `❌ [${app.name}] org: ${org ? org.name : 'null'}`);
+        this.addLog("error", `❌ [${app.name}] workspace: ${workspace ? workspace.name : 'null'}`);
+        this.addLog("error", `❌ [${app.name}] backupTimestamp: ${this.backupTimestamp || 'null'}`);
+        this.addLog("error", `❌ [${app.name}] backupPath: ${this.backupPath || 'null'}`);
       } else if (scanOnly) {
-        this.addLog("info", `ℹ️ [${app.name}] Modo scanOnly=${scanOnly} activo: Excel no se descargará ahora (se descargará durante el backup)`);
+        this.addLog("warning", `⚠️ [${app.name}] RAZÓN: Modo scanOnly=${scanOnly} activo (Excel se descargará durante el backup)`);
       } else if (typeof window === 'undefined' || !window.electron) {
-        this.addLog("warning", `⚠️ [${app.name}] Electron no disponible: Excel no se puede descargar`);
+        this.addLog("error", `❌ [${app.name}] RAZÓN: Electron no disponible`);
+        this.addLog("error", `❌ [${app.name}] window: ${typeof window !== 'undefined' ? 'existe' : 'no existe'}`);
+        this.addLog("error", `❌ [${app.name}] window.electron: ${typeof window !== 'undefined' && window.electron ? 'existe' : 'no existe'}`);
       } else {
-        this.addLog("warning", `⚠️ [${app.name}] Condición no cumplida para descargar Excel - Revisar lógica`);
+        this.addLog("error", `❌ [${app.name}] RAZÓN: Condición no cumplida - Revisar lógica`);
+        this.addLog("error", `❌ [${app.name}] folderPath: ${folderPath}`);
+        this.addLog("error", `❌ [${app.name}] scanOnly: ${scanOnly}`);
+        this.addLog("error", `❌ [${app.name}] window.electron: ${typeof window !== 'undefined' && !!window.electron}`);
       }
+      this.addLog("error", `❌❌❌ [${app.name}] =============================================== ❌❌❌`);
     }
     
     // PASO 4: Crear carpeta "files" SIEMPRE que haya archivos (INDEPENDIENTE de si se descargó Excel)
-    this.addLog("info", `🔍 [${app.name}] Verificando condiciones para crear carpeta files: folderPath=${!!folderPath}, allFiles.length=${allFiles.length}, electron=${typeof window !== 'undefined' && !!window.electron}`);
+    // CRÍTICO: La carpeta "files" DEBE crearse durante el escaneo si hay archivos
+    this.addLog("warning", `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    this.addLog("warning", `📁 [${app.name}] ========== CREACIÓN DE CARPETA FILES ==========`);
+    this.addLog("warning", `📁 [${app.name}] folderPath: ${folderPath || 'null'}`);
+    this.addLog("warning", `📁 [${app.name}] allFiles.length: ${allFiles.length}`);
+    this.addLog("warning", `📁 [${app.name}] Electron disponible: ${typeof window !== 'undefined' && !!window.electron}`);
+    this.addLog("warning", `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    
     if (folderPath && allFiles.length > 0 && typeof window !== 'undefined' && window.electron) {
       try {
         // Usar path.join si está disponible (Electron), sino usar concatenación con /
@@ -1161,33 +1292,71 @@ export class PodioBackupService {
         } else {
           filesFolder = `${folderPath}/files`;
         }
-        this.addLog("info", `📁 [${app.name}] INICIANDO creación de carpeta files: ${filesFolder}`);
-        this.addLog("info", `📁 [${app.name}] Llamando a ensureFolderExists con: ${filesFolder}`);
+        
+        this.addLog("warning", `📁 [${app.name}] INICIANDO creación de carpeta files...`);
+        this.addLog("warning", `📁 [${app.name}] Ruta completa: ${filesFolder}`);
+        this.addLog("warning", `📁 [${app.name}] Llamando a ensureFolderExists...`);
+        
         await this.ensureFolderExists(filesFolder);
-        this.addLog("success", `✅ [${app.name}] Carpeta files creada exitosamente: ${filesFolder} (${allFiles.length} archivos)`);
+        
+        // Verificar que la carpeta se creó correctamente
+        if (typeof (window.electron.fileSystem as any)?.existsSync === 'function') {
+          const folderExists = await ((window.electron.fileSystem as any).existsSync(filesFolder));
+          if (folderExists) {
+            this.addLog("success", `✅✅✅ [${app.name}] Carpeta files creada y verificada exitosamente: ${filesFolder} (${allFiles.length} archivos) ✅✅✅`);
+          } else {
+            this.addLog("error", `❌❌❌ [${app.name}] ERROR: La carpeta files NO existe después de crearla: ${filesFolder} ❌❌❌`);
+          }
+        } else {
+          this.addLog("success", `✅ [${app.name}] Carpeta files creada exitosamente: ${filesFolder} (${allFiles.length} archivos)`);
+        }
       } catch (error) {
-        this.addLog("error", `❌ [${app.name}] Error crítico creando carpeta files: ${error instanceof Error ? error.message : String(error)}`);
+        this.addLog("error", `❌❌❌ [${app.name}] ========== ERROR CRÍTICO CREANDO CARPETA FILES ========== ❌❌❌`);
+        this.addLog("error", `❌ [${app.name}] Error: ${error instanceof Error ? error.message : String(error)}`);
         this.addLog("error", `❌ [${app.name}] Stack trace: ${error instanceof Error ? error.stack : 'N/A'}`);
+        this.addLog("error", `❌ [${app.name}] folderPath: ${folderPath}`);
+        this.addLog("error", `❌ [${app.name}] allFiles.length: ${allFiles.length}`);
+        this.addLog("error", `❌❌❌ [${app.name}] =============================================== ❌❌❌`);
         // No lanzar error para no detener el proceso, pero es crítico
       }
     } else {
+      // Log detallado de por qué NO se puede crear carpeta files
+      this.addLog("warning", `⚠️ [${app.name}] ========== NO SE PUEDE CREAR CARPETA FILES ==========`);
       if (!folderPath) {
-        this.addLog("warning", `⚠️ [${app.name}] No se puede crear carpeta files: folderPath es null`);
+        this.addLog("error", `❌ [${app.name}] RAZÓN: folderPath es null`);
+        this.addLog("error", `❌ [${app.name}] org: ${org ? org.name : 'null'}`);
+        this.addLog("error", `❌ [${app.name}] workspace: ${workspace ? workspace.name : 'null'}`);
+        this.addLog("error", `❌ [${app.name}] backupTimestamp: ${this.backupTimestamp || 'null'}`);
+        this.addLog("error", `❌ [${app.name}] backupPath: ${this.backupPath || 'null'}`);
       } else if (allFiles.length === 0) {
-        this.addLog("info", `ℹ️ [${app.name}] App no tiene archivos (allFiles.length=${allFiles.length}), no se crea carpeta files`);
+        this.addLog("info", `ℹ️ [${app.name}] Razón: App no tiene archivos (allFiles.length=${allFiles.length}), no se crea carpeta files`);
       } else if (typeof window === 'undefined' || !window.electron) {
-        this.addLog("warning", `⚠️ [${app.name}] Electron no disponible: carpeta files no se puede crear`);
+        this.addLog("error", `❌ [${app.name}] RAZÓN: Electron no disponible`);
+        this.addLog("error", `❌ [${app.name}] window: ${typeof window !== 'undefined' ? 'existe' : 'no existe'}`);
+        this.addLog("error", `❌ [${app.name}] window.electron: ${typeof window !== 'undefined' && window.electron ? 'existe' : 'no existe'}`);
+      } else {
+        this.addLog("error", `❌ [${app.name}] RAZÓN: Condición no cumplida - Revisar lógica`);
+        this.addLog("error", `❌ [${app.name}] folderPath: ${folderPath}`);
+        this.addLog("error", `❌ [${app.name}] allFiles.length: ${allFiles.length}`);
+        this.addLog("error", `❌ [${app.name}] window.electron: ${typeof window !== 'undefined' && !!window.electron}`);
       }
+      this.addLog("warning", `⚠️ [${app.name}] ===============================================`);
     }
     
-    // PASO 4: Guardar datos en BD (NO en caché - esto es para el respaldo)
+    // PASO 5: Guardar datos en BD (NO en caché - esto es para el respaldo)
     // IMPORTANTE: Guardar TODA la data necesaria en BD para realizar el respaldo:
     // - URLs de descarga de archivos
     // - Información de apps, items, archivos
     // - Rutas de carpetas
+    this.addLog("warning", `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    this.addLog("warning", `💾 ${appCounter} GUARDANDO RUTAS DE DESCARGA DE ARCHIVOS EN BASE DE DATOS`);
+    this.addLog("warning", `💾 ${appCounter} App: ${app.name} (${allFiles.length} archivos)`);
+    this.addLog("warning", `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    
     if (folderPath && typeof window !== 'undefined' && window.electron && window.electron.db && this.currentScanId) {
       try {
         // Guardar app en BD (incluso si no tiene archivos)
+        this.addLog("info", `💾 ${appCounter} Guardando app en BD: ${app.name} (app_id: ${app.app_id})`);
         await window.electron.db.addApp(this.currentScanId, {
           org_name: org.name,
           space_id: workspace.space_id,
@@ -1196,16 +1365,32 @@ export class PodioBackupService {
           app_name: app.name,
           folder_path: folderPath
         });
-        this.addLog("info", `💾 [${app.name}] App guardada en BD (app_id: ${app.app_id}, folder: ${folderPath})`);
+        this.addLog("success", `✅ ${appCounter} App guardada en BD: ${app.name} (app_id: ${app.app_id}, folder: ${folderPath})`);
         
         // Guardar archivos en BD con URLs de descarga (CRÍTICO para el respaldo)
         if (allFiles.length > 0) {
-          const filesFolder = `${folderPath}/files`;
+          let filesFolder: string;
+          if (typeof require !== 'undefined') {
+            try {
+              const path = require('path');
+              filesFolder = path.join(folderPath, 'files');
+            } catch {
+              filesFolder = `${folderPath}/files`;
+            }
+          } else {
+            filesFolder = `${folderPath}/files`;
+          }
+          
+          this.addLog("info", `💾 ${appCounter} Guardando ${allFiles.length} archivos en BD con URLs de descarga...`);
+          let filesSaved = 0;
+          let filesWithoutUrl = 0;
+          
           for (const file of allFiles) {
             // IMPORTANTE: Guardar URL de descarga - esto NO es caché, es data necesaria para el respaldo
             const downloadUrl = file.download_link || file.link || '';
             if (!downloadUrl) {
-              this.addLog("warning", `⚠️ [${app.name}] Archivo ${file.name} (file_id: ${file.file_id}) no tiene URL de descarga`);
+              this.addLog("warning", `⚠️ ${appCounter} Archivo ${file.name} (file_id: ${file.file_id}) no tiene URL de descarga`);
+              filesWithoutUrl++;
             }
             
             await window.electron.db.addFile(this.currentScanId, {
@@ -1218,39 +1403,54 @@ export class PodioBackupService {
               download_url: downloadUrl, // URL de descarga guardada en BD para el respaldo
               folder_path: filesFolder
             });
+            filesSaved++;
           }
-          this.addLog("success", `💾 [${app.name}] ${allFiles.length} archivos guardados en BD con URLs de descarga`);
+          
+          this.addLog("success", `✅ ${appCounter} ${filesSaved} archivos guardados en BD con URLs de descarga`);
+          if (filesWithoutUrl > 0) {
+            this.addLog("warning", `⚠️ ${appCounter} ${filesWithoutUrl} archivos sin URL de descarga`);
+          }
         } else {
-          this.addLog("info", `💾 [${app.name}] App guardada en BD (sin archivos)`);
+          this.addLog("info", `ℹ️ ${appCounter} App guardada en BD (sin archivos)`);
         }
       } catch (dbError) {
-        this.addLog("error", `❌ [${app.name}] Error crítico guardando en BD: ${dbError instanceof Error ? dbError.message : String(dbError)}`);
+        this.addLog("error", `❌ ${appCounter} ========== ERROR CRÍTICO GUARDANDO EN BD ==========`);
+        this.addLog("error", `❌ ${appCounter} App: ${app.name}`);
+        this.addLog("error", `❌ ${appCounter} Error: ${dbError instanceof Error ? dbError.message : String(dbError)}`);
+        this.addLog("error", `❌ ${appCounter} ===============================================`);
         // No lanzar error para no detener el proceso, pero es crítico
       }
     } else if (!this.currentScanId) {
-      this.addLog("warning", `⚠️ [${app.name}] No se puede guardar en BD: currentScanId no está definido`);
+      this.addLog("warning", `⚠️ ${appCounter} No se puede guardar en BD: currentScanId no está definido`);
+    } else if (!folderPath) {
+      this.addLog("warning", `⚠️ ${appCounter} No se puede guardar en BD: folderPath es null`);
+    } else if (typeof window === 'undefined' || !window.electron || !window.electron.db) {
+      this.addLog("warning", `⚠️ ${appCounter} No se puede guardar en BD: Electron o BD no disponible`);
     }
     
     // Actualizar progreso con indicadores numéricos en tiempo real
-    if (progressCallback) {
+    if (progressCallback && totalApps !== undefined && appIndex !== undefined) {
+      // Calcular progreso basado en apps procesadas vs total
+      const appsProcessed = appIndex + 1;
+      const progress = Math.min(95, 1 + ((appsProcessed / totalApps) * 94));
+      
+      // Crear texto descriptivo con información de la app actual y contadores
+      const status = `App ${appsProcessed}/${totalApps}: ${app.name} | Apps: ${this.backupCounts.applications} | Items: ${this.backupCounts.items} | Archivos: ${this.backupCounts.files} | ${this.backupStats.backupSize.toFixed(2)} GB`;
+      this.updateProgress(progress, status, progressCallback);
+    } else if (progressCallback) {
+      // Fallback si no tenemos información de índices
       const status = `Escaneando... (${this.backupCounts.applications} apps, ${this.backupCounts.items} items, ${this.backupCounts.files} archivos, ${this.backupStats.backupSize.toFixed(2)} GB)`;
-      // Calcular progreso basado en apps procesadas vs total estimado
-      // Usar una estimación más realista: 5% inicial + 90% para apps (máx 95%)
-      // Asumir que cada app representa aproximadamente 0.1-0.5% del progreso total
-      // Esto es mejor que la fórmula anterior que solo multiplicaba por 2
-      const baseProgress = 5; // 5% inicial
-      const maxAppsProgress = 90; // 90% máximo para apps
-      // Estimación: si procesamos muchas apps, el progreso debe avanzar más rápido
-      // Usar una función logarítmica para que avance más rápido al inicio
+      const baseProgress = 5;
+      const maxAppsProgress = 90;
       const appsProgress = Math.min(maxAppsProgress, Math.log10(1 + this.backupCounts.applications) * 20);
       const estimatedProgress = Math.min(95, baseProgress + appsProgress);
       this.updateProgress(estimatedProgress, status, progressCallback);
     }
     
-    this.addLog("info", `📊 App procesada: ${app.name} - ${items.length} items, ${allFiles.length} archivos`);
+    this.addLog("info", `📊 ${appCounter} App procesada: ${app.name} - ${itemsCount} items, ${allFiles.length} archivos`);
     
     return {
-      items,
+      itemsCount,
       files: allFiles
     };
   }
@@ -1414,7 +1614,7 @@ export class PodioBackupService {
     if (!isInitializationLog || process.env.NODE_ENV === 'development') {
       // En producción, solo loguear errores y warnings, no info de inicialización
       if (level === 'error' || level === 'warning' || process.env.NODE_ENV === 'development') {
-        console.log(`[${level.toUpperCase()}] ${message}`)
+    console.log(`[${level.toUpperCase()}] ${message}`)
       }
     }
 
@@ -1447,9 +1647,16 @@ export class PodioBackupService {
 
     this.lastProgress = newProgress
 
+    // Agregar porcentaje al texto del status si no lo tiene
+    const progressPercent = Math.round(newProgress);
+    let finalStatus = status;
+    if (!status.includes(`${progressPercent}%`) && !status.includes('(')) {
+      finalStatus = `${status} (${progressPercent}%)`;
+    }
+
     progressCallback({
       progress: newProgress,
-      status: status,
+      status: finalStatus,
       counts: this.backupCounts,
       stats: this.backupStats,
       logs: [...this.logs],
@@ -1612,15 +1819,27 @@ export class PodioBackupService {
         // Monitorear headers de rate limit
         this.updateRateLimitsFromHeaders(response.headers, endpoint, method)
 
+        // Obtener tamaño de la respuesta si está disponible
+        const contentLength = response.headers.get('Content-Length')
+        const responseBytes = contentLength ? parseInt(contentLength, 10) : undefined
+
+        // Determinar el tipo de rate limit para el registro
+        const rateType = this.isRateLimitedOperation(endpoint, method) ? 'rateLimited' : 'general'
+
         if (!response.ok) {
           const errorText = await response.text()
           this.addLog("error", `Error en peticiÃ³n API (${method} ${url}): ${response.status} ${errorText}`)
+
+          // Registrar la llamada fallida en la BD (asíncrono, no bloquea)
+          this.logApiRequest(method, endpoint, rateType, response.status, responseBytes, { error: errorText.substring(0, 500) })
 
           // CRÍTICO: Los errores 400 por límites excedidos NO son rate limits
           // Detectar errores 400 con "invalid_value" y "must not be larger than"
           if (response.status === 400) {
             try {
               const errorData = JSON.parse(errorText)
+              
+              // Detectar si es un error de límite excedido (NO es rate limit)
               if (errorData.error === "invalid_value" && 
                   errorData.error_description && 
                   errorData.error_description.includes("must not be larger than")) {
@@ -1629,13 +1848,69 @@ export class PodioBackupService {
                 // Lanzar error específico para que no se interprete como rate limit
                 throw new Error(`INVALID_LIMIT_ERROR:${errorData.error_description}`)
               }
+              
+              // Detectar si es un rate limit real en error 400
+              // Buscar múltiples patrones de rate limit
+              const errorDesc = errorData.error_description || errorData.error || ''
+              const errorLower = errorDesc.toLowerCase()
+              const isRateLimit = errorData.error === "rate_limit" || 
+                                  errorData.error === "rate_limit_exceeded" ||
+                                  errorLower.includes("rate limit") ||
+                                  errorLower.includes("rate_limit") ||
+                                  errorLower.includes("too many requests") ||
+                                  errorLower.includes("quota exceeded") ||
+                                  errorLower.includes("request limit exceeded")
+              
+              if (isRateLimit) {
+                let waitTime = 60 // Valor predeterminado: 1 minuto
+                let limitType: "general" | "rateLimited" = this.isRateLimitedOperation(endpoint, method) ? "rateLimited" : "general"
+                
+                // Intentar extraer el tiempo de espera
+                const waitTimeMatch = errorDesc.match(/(\d+)\s*(seconds?|minutes?|hours?)/i)
+                if (waitTimeMatch && waitTimeMatch[1]) {
+                  const value = parseInt(waitTimeMatch[1], 10)
+                  const unit = waitTimeMatch[2].toLowerCase()
+                  if (unit.includes('minute')) {
+                    waitTime = value * 60
+                  } else if (unit.includes('hour')) {
+                    waitTime = value * 3600
+                  } else {
+                    waitTime = value
+                  }
+                }
+                
+                this.setActiveRateLimit(limitType, waitTime)
+                throw new Error(`RATE_LIMIT_ERROR:${waitTime}:${limitType}`)
+              }
             } catch (parseError) {
-              // Si no se puede parsear, continuar con el manejo normal
+              // Si no se puede parsear, verificar si el texto contiene indicadores de rate limit
+              const errorLower = errorText.toLowerCase()
+              if (errorLower.includes("rate limit") || 
+                  errorLower.includes("rate_limit") ||
+                  errorLower.includes("too many requests") ||
+                  errorLower.includes("quota exceeded")) {
+                let waitTime = 60
+                const waitTimeMatch = errorText.match(/(\d+)\s*(seconds?|minutes?|hours?)/i)
+                if (waitTimeMatch && waitTimeMatch[1]) {
+                  const value = parseInt(waitTimeMatch[1], 10)
+                  const unit = waitTimeMatch[2].toLowerCase()
+                  if (unit.includes('minute')) {
+                    waitTime = value * 60
+                  } else if (unit.includes('hour')) {
+                    waitTime = value * 3600
+                  } else {
+                    waitTime = value
+                  }
+                }
+                const limitType: "general" | "rateLimited" = this.isRateLimitedOperation(endpoint, method) ? "rateLimited" : "general"
+                this.setActiveRateLimit(limitType, waitTime)
+                throw new Error(`RATE_LIMIT_ERROR:${waitTime}:${limitType}`)
+              }
             }
           }
 
           // Mejorar la detecciÃ³n de errores de rate limit
-          if (response.status === 420) {
+          if (response.status === 420 || response.status === 429) {
             // Intentar extraer el tiempo de espera del mensaje de error
             let waitTime = 60 // Valor predeterminado: 1 minuto
             let limitType: "general" | "rateLimited" = "general"
@@ -1643,7 +1918,7 @@ export class PodioBackupService {
             try {
               // Intentar parsear como JSON
               const errorData = JSON.parse(errorText)
-              if (errorData.error === "rate_limit") {
+              if (errorData.error === "rate_limit" || errorData.error === "rate_limit_exceeded") {
                 // Buscar informaciÃ³n sobre el tiempo de espera
                 if (errorData.error_description && typeof errorData.error_description === "string") {
                   const waitTimeMatch = errorData.error_description.match(/(\d+)\s*seconds?/i)
@@ -1679,10 +1954,14 @@ export class PodioBackupService {
 
         // Manejar respuestas sin contenido (por ejemplo, PUT/DELETE en Podio)
         if (response.status === 204) {
+          // Registrar la llamada exitosa en la BD (asíncrono, no bloquea)
+          this.logApiRequest(method, endpoint, rateType, 204, responseBytes)
           return null as T;
         }
         const text = await response.text();
         if (!text) {
+          // Registrar la llamada exitosa en la BD (asíncrono, no bloquea)
+          this.logApiRequest(method, endpoint, rateType, response.status, responseBytes)
           return null as T;
         }
         let responseData: any = null;
@@ -1691,6 +1970,9 @@ export class PodioBackupService {
         } catch (e) {
           responseData = null;
         }
+        
+        // Registrar la llamada exitosa en la BD (asíncrono, no bloquea)
+        this.logApiRequest(method, endpoint, rateType, response.status, responseBytes)
         
         // Guardar en cachÃ© para operaciones GET exitosas (solo si NO estamos escaneando)
         // Durante un escaneo nuevo, NO guardar en caché para obtener siempre datos frescos
@@ -1725,6 +2007,15 @@ export class PodioBackupService {
    */
   protected async getOrganizations(): Promise<PodioOrganization[]> {
     try {
+      // CRÍTICO: Verificar caché primero para evitar llamadas duplicadas
+      // Las organizaciones no cambian frecuentemente, usar caché largo
+      const cacheKey = this.getCacheKey("/org/", "GET")
+      const cached = this.cache.get(cacheKey)
+      if (cached && !this.isScanning) {
+        this.addLog("info", "Usando organizaciones desde caché (evitando llamada duplicada)")
+        return cached.data as PodioOrganization[]
+      }
+      
       this.addLog("info", "Obteniendo organizaciones...")
       const response = await this.apiRequest<any>("/org/")
 
@@ -1733,12 +2024,19 @@ export class PodioBackupService {
         return []
       }
 
-      this.addLog("success", `Se encontraron ${response.length} organizaciones`)
-      return response.map((org: any) => ({
+      const organizations = response.map((org: any) => ({
         org_id: org.org_id,
         name: org.name,
         url: org.url,
       }))
+
+      this.addLog("success", `Se encontraron ${organizations.length} organizaciones`)
+      
+      // Guardar en caché con TTL largo (1 hora) para evitar llamadas duplicadas
+      // Incluso durante escaneo, guardar en caché para evitar múltiples llamadas
+      this.setCache("/org/", organizations, "GET", this.CACHE_TTL.organizations)
+      
+      return organizations
     } catch (error) {
       this.addLog("error", `Error al obtener organizaciones: ${error instanceof Error ? error.message : String(error)}`)
       throw new Error(`Error al obtener organizaciones: ${error instanceof Error ? error.message : String(error)}`)
@@ -2055,9 +2353,20 @@ export class PodioBackupService {
   /**
    * Get items count for an application
    */
-  private async getItemsCount(appId: number, progressCallback?: ProgressCallback): Promise<number> {
+  /**
+   * Obtener solo el conteo de items de una aplicación (optimizado)
+   * 
+   * @param appId - ID de la aplicación
+   * @returns Número de items en la aplicación
+   * 
+   * @remarks
+   * - Usa solo 1 llamada API: /item/app/{appId}/count
+   * - NO actualiza backupStats.items aquí (se actualiza en processApplicationParallel)
+   * - Usado por processApplicationParallel para obtener conteo sin descargar todos los items
+   */
+  protected async getItemsCount(appId: number): Promise<number> {
     try {
-      this.addLog("info", `Obteniendo conteo de elementos para la aplicaciÃ³n ${appId}...`)
+      this.addLog("info", `Obteniendo conteo de elementos para la aplicación ${appId}...`)
       const response = await this.apiRequest<any>(`/item/app/${appId}/count`)
 
       if (typeof response.count !== "number") {
@@ -2065,26 +2374,15 @@ export class PodioBackupService {
         return 0
       }
 
-      // Actualizar estadÃ­sticas inmediatamente
-      this.backupStats.items += response.count
+      // NO actualizar backupStats.items aquí - se actualiza en processApplicationParallel
+      // para evitar duplicación cuando se llama desde múltiples lugares
 
-      // Notificar al callback si existe
-      if (progressCallback) {
-        progressCallback({
-          progress: this.lastProgress,
-          status: `Encontrados ${response.count} elementos en la aplicaciÃ³n ${appId}`,
-          counts: this.backupCounts,
-          stats: this.backupStats,
-          logs: [...this.logs],
-        })
-      }
-
-      this.addLog("success", `Se encontraron ${response.count} elementos para la aplicaciÃ³n ${appId}`)
+      this.addLog("success", `Se encontraron ${response.count} elementos para la aplicación ${appId}`)
       return response.count
     } catch (error) {
       this.addLog(
         "warning",
-        `Error al obtener conteo de elementos para la aplicaciÃ³n ${appId}: ${error instanceof Error ? error.message : String(error)}`,
+        `Error al obtener conteo de elementos para la aplicación ${appId}: ${error instanceof Error ? error.message : String(error)}`,
       )
       return 0 // Continuamos con el proceso aunque falle
     }
@@ -2221,13 +2519,304 @@ export class PodioBackupService {
    * Este endpoint NO soporta paginación (limit/offset). Descarga el Excel completo
    * de todos los items de la aplicación en una sola petición.
    */
-  protected async downloadAppExcel(appId: number, folderPath: string, appName: string, progressCallback?: ProgressCallback, excelIndex?: number, totalExcels?: number): Promise<void> {
+  /**
+   * Iniciar exportación de Excel usando Batch API de Podio
+   * 
+   * @param appId - ID de la aplicación a exportar
+   * @returns batch_id para monitorear el proceso
+   * 
+   * @remarks
+   * - Usa POST /item/app/{app_id}/export/xlsx para iniciar exportación asíncrona
+   * - Retorna batch_id que se usa para monitorear el estado
+   * - Mucho más eficiente que descargar directamente (solo 1 llamada API)
+   */
+  protected async exportAppToExcelBatch(appId: number): Promise<number> {
     try {
-      this.addLog("info", `📊 [downloadAppExcel] INICIANDO descarga de Excel para app: ${appName} (appId: ${appId})`);
-      this.addLog("info", `📊 [downloadAppExcel] folderPath: ${folderPath}`);
-      this.addLog("info", `📊 [downloadAppExcel] Verificando rate limit...`);
+      this.addLog("warning", `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+      this.addLog("warning", `📦 [Batch API] INICIANDO EXPORTACIÓN DE EXCEL PARA APP ${appId}...`);
       
-      // Verificar rate limit antes de iniciar la descarga
+      // Verificar autenticación
+      if (!this.authData) {
+        this.addLog("error", "❌❌❌ No autenticado. Llama a authenticate() primero. ❌❌❌");
+        throw new Error("No autenticado. Llama a authenticate() primero.");
+      }
+      
+      // Endpoint para iniciar exportación batch
+      const endpoint = `/item/app/${appId}/export/xlsx`;
+      const method = 'POST';
+      
+      // Usar enqueueRequest para respetar rate limits
+      const response = await this.enqueueRequest<any>(async () => {
+        const url = `${this.baseUrl}${endpoint}`;
+        this.addLog("warning", `📡 Realizando petición POST a ${url}`);
+        this.addLog("warning", `📡 Body: {} (JSON vacío como requiere Podio)`);
+        
+        const fetchResponse = await fetch(url, {
+          method: 'POST',
+          headers: {
+            Authorization: `OAuth2 ${this.authData!.access_token}`,
+            'Content-Type': 'application/json',
+            'User-Agent': 'Podio-Backup-Tool/1.0',
+          },
+          body: JSON.stringify({}), // Enviar body JSON vacío como requiere Podio
+        });
+        
+        // Actualizar rate limits desde headers
+        this.updateRateLimitsFromHeaders(fetchResponse.headers, endpoint, method);
+        
+        if (!fetchResponse.ok) {
+          if (fetchResponse.status === 420 || fetchResponse.status === 429) {
+            const retryAfter = fetchResponse.headers.get('Retry-After');
+            const waitTime = retryAfter ? Number.parseInt(retryAfter, 10) : 60;
+            this.addLog("error", `❌ Rate limit detectado al iniciar exportación batch: status=${fetchResponse.status}, retryAfter=${waitTime}s`);
+            throw new Error(`RATE_LIMIT_ERROR:${waitTime}:general`);
+          }
+          const errorText = await fetchResponse.text();
+          this.addLog("error", `❌ Error HTTP al iniciar exportación batch: status=${fetchResponse.status}`);
+          this.addLog("error", `❌ Respuesta completa del error: ${errorText}`);
+          
+          // Intentar parsear el error como JSON para obtener más detalles
+          try {
+            const errorJson = JSON.parse(errorText);
+            this.addLog("error", `❌ Error parseado: ${JSON.stringify(errorJson, null, 2)}`);
+            if (errorJson.error_description) {
+              this.addLog("error", `❌ Descripción: ${errorJson.error_description}`);
+            }
+          } catch (e) {
+            // No es JSON, ya tenemos el texto
+          }
+          
+          throw new Error(`Error HTTP ${fetchResponse.status}: ${errorText.substring(0, 500)}`);
+        }
+        
+        const responseText = await fetchResponse.text();
+        this.addLog("info", `📥 Respuesta recibida (${responseText.length} bytes)`);
+        
+        // Log completo de la respuesta para debugging
+        try {
+          const responseJson = JSON.parse(responseText);
+          this.addLog("info", `📥 Respuesta JSON: ${JSON.stringify(responseJson, null, 2)}`);
+          return responseJson;
+        } catch (e) {
+          this.addLog("error", `❌ No se pudo parsear respuesta como JSON: ${responseText.substring(0, 200)}`);
+          throw new Error(`Respuesta inválida de la API: no es JSON válido`);
+        }
+      }, endpoint, method);
+      
+      // La respuesta de Podio puede tener diferentes estructuras:
+      // 1. { batch_id: 123 }
+      // 2. { batch: { batch_id: 123 } }
+      // 3. { file: { file_id: 123, link: "..." } } - si es inmediato
+      // 4. { id: 123 } - algunos casos
+      this.addLog("info", `🔍 Analizando respuesta del batch: ${JSON.stringify(response, null, 2)}`);
+      
+      let batchId: number | null = null;
+      
+      // Intentar diferentes estructuras de respuesta
+      if (response.batch_id) {
+        batchId = response.batch_id;
+      } else if (response.batch?.batch_id) {
+        batchId = response.batch.batch_id;
+      } else if (response.id) {
+        batchId = response.id;
+      } else if (response.file) {
+        // Si la respuesta ya tiene el archivo, significa que fue inmediato
+        // Esto puede pasar con apps pequeñas
+        this.addLog("info", `✅ Exportación completada inmediatamente, archivo disponible`);
+        this.addLog("info", `📁 Archivo disponible: file_id=${response.file.file_id}, link=${response.file.link || response.file.perma_link}`);
+        // En este caso, devolver el file_id como si fuera batch_id para compatibilidad
+        // pero marcar que es inmediato
+        if (response.file.file_id) {
+          // Guardar información del archivo para uso inmediato
+          (this as any)._immediateExportFile = {
+            file_id: response.file.file_id,
+            link: response.file.link || response.file.perma_link,
+            name: response.file.name || `export_${appId}.xlsx`,
+            size: response.file.size || 0,
+          };
+          // Usar file_id como batch_id temporal para compatibilidad con waitForBatchCompletion
+          batchId = response.file.file_id;
+          this.addLog("info", `⚡ Usando file_id como batch_id temporal: ${batchId}`);
+        } else {
+          throw new Error("Archivo inmediato sin file_id en la respuesta");
+        }
+      }
+      
+      if (!batchId) {
+        this.addLog("error", `❌ Respuesta inesperada al iniciar exportación batch`);
+        this.addLog("error", `❌ Estructura recibida: ${JSON.stringify(response, null, 2)}`);
+        throw new Error(`No se encontró batch_id en la respuesta. Estructura: ${JSON.stringify(response)}`);
+      }
+      
+      this.addLog("success", `✅ Exportación batch iniciada: batch_id=${batchId}`);
+      return batchId;
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("RATE_LIMIT_ERROR:")) {
+        throw error; // Propagar rate limit
+      }
+      this.addLog("error", `❌ Error al iniciar exportación batch para app ${appId}: ${error instanceof Error ? error.message : String(error)}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Esperar a que un batch se complete haciendo polling periódico
+   * 
+   * @param batchId - ID del batch a monitorear
+   * @param progressCallback - Callback opcional para reportar progreso
+   * @returns Información del archivo cuando el batch está completo
+   * 
+   * @remarks
+   * - Hace polling de GET /batch/{batch_id} cada 5-10 segundos
+   * - Maneja rate limits durante el polling
+   * - Timeout máximo: 30 minutos
+   */
+  protected async waitForBatchCompletion(
+    batchId: number,
+    progressCallback?: ProgressCallback
+  ): Promise<{ file_id: number; link: string; name: string; size: number }> {
+    // Verificar si es una exportación inmediata (file_id usado como batch_id temporal)
+    const immediateFile = (this as any)._immediateExportFile;
+    if (immediateFile && immediateFile.file_id === batchId) {
+      this.addLog("info", `⚡ Exportación inmediata detectada, usando archivo directamente`);
+      // Limpiar la referencia temporal
+      delete (this as any)._immediateExportFile;
+      return immediateFile;
+    }
+    
+    const MAX_WAIT_TIME = 30 * 60 * 1000; // 30 minutos
+    const POLL_INTERVAL = 5000; // 5 segundos
+    const startTime = Date.now();
+    
+    this.addLog("info", `⏳ [Batch API] Monitoreando batch ${batchId}...`);
+    
+    while (true) {
+      // Verificar timeout
+      const elapsed = Date.now() - startTime;
+      if (elapsed > MAX_WAIT_TIME) {
+        this.addLog("error", `❌ Timeout esperando batch ${batchId} (${Math.round(elapsed / 1000)}s)`);
+        throw new Error(`Timeout esperando batch ${batchId}`);
+      }
+      
+      // Verificar si el escaneo fue cancelado
+      if (this.isScanCancelled) {
+        this.addLog("warning", "🚫 Escaneo cancelado. Deteniendo monitoreo de batch...");
+        throw new Error("ESCANEO_CANCELADO: El escaneo fue cancelado por el usuario");
+      }
+      
+      try {
+        // Consultar estado del batch
+        const endpoint = `/batch/${batchId}`;
+        const method = 'GET';
+        
+        const batchInfo = await this.enqueueRequest<any>(async () => {
+          const url = `${this.baseUrl}${endpoint}`;
+          const fetchResponse = await fetch(url, {
+            method: 'GET',
+            headers: {
+              Authorization: `OAuth2 ${this.authData!.access_token}`,
+              'User-Agent': 'Podio-Backup-Tool/1.0',
+            },
+          });
+          
+          // Actualizar rate limits desde headers
+          this.updateRateLimitsFromHeaders(fetchResponse.headers, endpoint, method);
+          
+          if (!fetchResponse.ok) {
+            if (fetchResponse.status === 420 || fetchResponse.status === 429) {
+              const retryAfter = fetchResponse.headers.get('Retry-After');
+              const waitTime = retryAfter ? Number.parseInt(retryAfter, 10) : 60;
+              throw new Error(`RATE_LIMIT_ERROR:${waitTime}:general`);
+            }
+            const errorText = await fetchResponse.text();
+            throw new Error(`Error HTTP ${fetchResponse.status}: ${errorText.substring(0, 200)}`);
+          }
+          
+          return await fetchResponse.json();
+        }, endpoint, method);
+        
+        const status = batchInfo.status;
+        const completed = batchInfo.completed || 0;
+        const failed = batchInfo.failed || 0;
+        const skipped = batchInfo.skipped || 0;
+        
+        // Calcular progreso aproximado si hay información disponible
+        const total = completed + failed + skipped;
+        const progressPercent = total > 0 ? Math.round((completed / total) * 100) : 0;
+        
+        this.addLog("info", `📊 [Batch ${batchId}] Estado: ${status}, Completados: ${completed}, Fallidos: ${failed}, Omitidos: ${skipped} (${progressPercent}%)`);
+        
+        if (status === "completed") {
+          // Batch completado, obtener información del archivo
+          if (!batchInfo.file) {
+            this.addLog("error", `❌ Batch ${batchId} completado pero no hay archivo disponible`);
+            throw new Error(`Batch ${batchId} completado pero no hay archivo disponible`);
+          }
+          
+          const fileInfo = {
+            file_id: batchInfo.file.file_id,
+            link: batchInfo.file.link || batchInfo.file.perma_link,
+            name: batchInfo.file.name || `export_${batchId}.xlsx`,
+            size: batchInfo.file.size || 0,
+          };
+          
+          if (!fileInfo.link) {
+            this.addLog("error", `❌ Batch ${batchId} completado pero el archivo no tiene link de descarga`);
+            throw new Error(`Batch ${batchId} completado pero el archivo no tiene link de descarga`);
+          }
+          
+          const elapsedSeconds = Math.round((Date.now() - startTime) / 1000);
+          this.addLog("success", `✅ Batch ${batchId} completado en ${elapsedSeconds}s. Archivo listo: ${fileInfo.name} (${(fileInfo.size / 1024).toFixed(2)} KB)`);
+          
+          return fileInfo;
+        } else if (status === "failed") {
+          this.addLog("error", `❌ Batch ${batchId} falló. Completados: ${completed}, Fallidos: ${failed}`);
+          throw new Error(`Batch ${batchId} falló durante el procesamiento`);
+        } else if (status === "processing" || status === "created") {
+          // Batch aún procesando, esperar antes del siguiente polling
+          if (progressCallback && total > 0) {
+            this.updateProgress(
+              this.lastProgress || 0,
+              `Procesando batch... (${progressPercent}% - ${completed}/${total} items)`,
+              progressCallback
+            );
+          }
+          
+          // Esperar antes del siguiente polling
+          await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
+        } else {
+          this.addLog("warning", `⚠️ Estado desconocido del batch ${batchId}: ${status}`);
+          await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
+        }
+      } catch (error) {
+        if (error instanceof Error && error.message.startsWith("RATE_LIMIT_ERROR:")) {
+          // Rate limit durante polling, propagar para manejo en nivel superior
+          throw error;
+        }
+        // Otros errores: loguear y reintentar después de un tiempo
+        this.addLog("warning", `⚠️ Error consultando batch ${batchId}: ${error instanceof Error ? error.message : String(error)}. Reintentando...`);
+        await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL * 2)); // Esperar más tiempo antes de reintentar
+      }
+    }
+  }
+
+  protected async downloadAppExcel(appId: number, folderPath: string, appName: string, progressCallback?: ProgressCallback, excelIndex?: number, totalExcels?: number): Promise<void> {
+    const excelStartTime = Date.now();
+    const excelCounter = excelIndex !== undefined && totalExcels !== undefined 
+      ? `[Excel ${excelIndex + 1}/${totalExcels}]` 
+      : '';
+    const excelFileName = `${this.sanitizeFileName(appName)}_oficial.xlsx`;
+    
+    try {
+      this.addLog("warning", `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+      this.addLog("warning", `🚀🚀🚀 ${excelCounter} INICIANDO DESCARGA DE EXCEL: ${appName} 🚀🚀🚀`);
+      this.addLog("warning", `📁 ${excelCounter} Carpeta: ${folderPath}`);
+      this.addLog("warning", `📊 ${excelCounter} Archivo: ${excelFileName}`);
+      this.addLog("warning", `📊 ${excelCounter} App ID: ${appId}`);
+      this.addLog("warning", `📊 ${excelCounter} Usando Batch API para optimizar llamadas...`);
+      this.addLog("warning", `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+      
+      // Verificar rate limit antes de iniciar
       if (this.isRateLimitActiveSync()) {
         const rateLimitInfo = this.getRateLimitInfo();
         const waitTime = Math.ceil(rateLimitInfo.remainingSeconds / 60);
@@ -2235,212 +2824,231 @@ export class PodioBackupService {
         throw new Error(`RATE_LIMIT_ERROR:${rateLimitInfo.remainingSeconds}:${rateLimitInfo.type}`);
       }
       
-      this.addLog("info", `📊 [downloadAppExcel] Rate limit OK, continuando...`);
-      this.addLog("info", `📊 Exportando Excel oficial para la app ${appName} (${appId})...`);
+        // Asegurar que la carpeta existe
+        await this.ensureFolderExists(folderPath);
+      this.addLog("info", `📊 [downloadAppExcel] Carpeta verificada: ${folderPath}`);
       
-      // Obtener conteo de items para logging (opcional, no necesario para la descarga)
-      try {
-        const countResponse = await this.apiRequest<any>(`/item/app/${appId}/count`);
-        const totalItems = countResponse.count || 0;
-        this.addLog("info", `📊 Total de items en ${appName}: ${totalItems}`);
-      } catch (countError) {
-        this.addLog("warning", `⚠️ No se pudo obtener el conteo de items, continuando con la descarga...`);
-      }
-      
-      // CORRECCIÓN: Usar el endpoint correcto según documentación de Podio
-      // Endpoint correcto: /app/{appId}/excel/ (NO /item/app/{appId}/xlsx/)
-      // Este endpoint NO soporta paginación, descarga el Excel completo
-      const url = `${this.baseUrl}/app/${appId}/excel/`;
-      const excelPath = `${folderPath}/${this.sanitizeFileName(appName)}_oficial.xlsx`;
-      
+      // PASO 1: Iniciar exportación batch
       this.addLog("info", `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-      this.addLog("info", `📊 [downloadAppExcel] Descargando Excel completo desde: ${url}`);
-      this.addLog("info", `📊 [downloadAppExcel] Asegurando que la carpeta existe: ${folderPath}`);
+      this.addLog("info", `📦 ${excelCounter} [Batch API] Paso 1: Iniciando exportación batch para ${appName}...`);
+      const batchId = await this.exportAppToExcelBatch(appId);
       
-      // Asegurar que la carpeta existe
-      await this.ensureFolderExists(folderPath);
-      this.addLog("info", `📊 [downloadAppExcel] Carpeta verificada, continuando...`);
-      this.addLog("info", `📁 Guardando en: ${excelPath}`);
+      // PASO 2: Esperar a que el batch se complete
+      this.addLog("info", `⏳ ${excelCounter} [Batch API] Paso 2: Esperando a que el batch ${batchId} se complete...`);
+      const fileInfo = await this.waitForBatchCompletion(batchId, progressCallback);
       
-      if (
-        typeof window !== 'undefined' &&
-        window.electron &&
-        window.electron.fileSystem &&
+      // PASO 3: Descargar el archivo desde el link proporcionado
+      this.addLog("info", `📥 ${excelCounter} [Batch API] Paso 3: Descargando archivo desde ${fileInfo.link}...`);
+      
+        if (
+          typeof window !== 'undefined' &&
+          window.electron &&
+          window.electron.fileSystem &&
         window.electron.fileSystem.saveFile
       ) {
-        try {
-          // CRÍTICO: Usar enqueueRequest para respetar rate limits y cola de peticiones
-          // Esto asegura que la petición pase por el sistema de gestión de rate limits
-          this.addLog("info", `📊 [downloadAppExcel] Encolando petición para descargar Excel...`);
-          
-          // Verificar autenticación antes de encolar
-          if (!this.authData) {
-            this.addLog("error", "No autenticado. Llama a authenticate() primero.");
-            throw new Error("No autenticado. Llama a authenticate() primero.");
+        // CRÍTICO: Usar path.join para construir la ruta correctamente (especialmente en Windows)
+        let excelPath: string;
+        if (typeof require !== 'undefined') {
+          try {
+            const path = require('path');
+            excelPath = path.join(folderPath, excelFileName);
+          } catch {
+            // Si require no está disponible, usar concatenación
+            excelPath = `${folderPath}/${excelFileName}`;
           }
+        } else {
+          excelPath = `${folderPath}/${excelFileName}`;
+        }
+        
+        this.addLog("warning", `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+        this.addLog("warning", `📁 ${excelCounter} RUTA COMPLETA DEL ARCHIVO: ${excelPath}`);
+        this.addLog("warning", `📁 ${excelCounter} Carpeta base: ${folderPath}`);
+        this.addLog("warning", `📁 ${excelCounter} Nombre archivo: ${excelFileName}`);
+        this.addLog("warning", `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+        
+        // Asegurar que la carpeta existe antes de descargar
+        this.addLog("info", `📁 ${excelCounter} Verificando que la carpeta existe: ${folderPath}`);
+        await this.ensureFolderExists(folderPath);
+        this.addLog("success", `✅ ${excelCounter} Carpeta verificada/creada: ${folderPath}`);
+        
+        // Descargar el archivo usando el link del batch
+        // Usar enqueueRequest para respetar rate limits
+        const endpoint = `/file/${fileInfo.file_id}/download`;
+        const method = 'GET';
+        
+        this.addLog("info", `📡 ${excelCounter} Iniciando descarga desde: ${fileInfo.link}`);
+        this.addLog("info", `📡 ${excelCounter} File ID: ${fileInfo.file_id}`);
+        this.addLog("info", `📡 ${excelCounter} Tamaño esperado: ${fileInfo.size ? `${(fileInfo.size / 1024).toFixed(2)} KB` : 'desconocido'}`);
+        
+        const buffer = await this.enqueueRequest<ArrayBuffer>(async () => {
+          this.addLog("info", `📡 ${excelCounter} Realizando petición GET a: ${fileInfo.link}`);
           
-          // CORRECCIÓN: Usar el endpoint correcto
-          const endpoint = `/app/${appId}/excel/`;
-          const method = 'GET';
-          
-          // Usar enqueueRequest con la firma correcta (endpoint, method)
-          const buffer = await this.enqueueRequest<ArrayBuffer>(async () => {
-            this.addLog("info", `📡 Realizando petición GET a ${url}`);
-            
-            const response = await fetch(url, {
+          const response = await fetch(fileInfo.link, {
               method: 'GET',
               headers: {
-                Authorization: `OAuth2 ${this.authData!.access_token}`,
-                'User-Agent': 'Podio-Backup-Tool/1.0',
-                'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+              Authorization: `OAuth2 ${this.authData!.access_token}`,
+              'User-Agent': 'Podio-Backup-Tool/1.0',
               },
             });
-            
-            this.addLog("info", `📡 Respuesta Podio: status=${response.status}, contentType=${response.headers.get('content-type')}`);
-            
-            // Actualizar rate limits desde headers (pasar endpoint y method)
-            this.updateRateLimitsFromHeaders(response.headers, endpoint, method);
-            
+          
+          // Actualizar rate limits desde headers
+          this.updateRateLimitsFromHeaders(response.headers, endpoint, method);
+          
             if (!response.ok) {
-              if (response.status === 420 || response.status === 429) {
-                // Extraer tiempo de espera del header Retry-After si está disponible
-                const retryAfter = response.headers.get('Retry-After');
-                const waitTime = retryAfter ? Number.parseInt(retryAfter, 10) : 60;
-                this.addLog("error", `❌ Rate limit detectado al descargar Excel: status=${response.status}, retryAfter=${waitTime}s`);
-                throw new Error(`RATE_LIMIT_ERROR:${waitTime}:general`);
-              }
-              const errorText = await response.text();
-              this.addLog("error", `❌ Error HTTP al descargar Excel: status=${response.status}, statusText=${response.statusText}, body=${errorText.substring(0, 200)}`);
-              
-              // Detectar errores 400 por límites inválidos
-              if (response.status === 400) {
-                try {
-                  const errorData = JSON.parse(errorText);
-                  if (errorData.error === "invalid_value" && 
-                      errorData.error_description && 
-                      errorData.error_description.includes("must not be larger than")) {
-                    this.addLog("error", `❌ ERROR DE LÍMITE EXCEDIDO: ${errorData.error_description}`);
-                    this.addLog("error", `❌ El endpoint /app/{appId}/excel/ NO soporta parámetros limit/offset`);
-                    throw new Error(`INVALID_LIMIT_ERROR:${errorData.error_description}`);
-                  }
-                } catch (parseError) {
-                  // Si no es parseable, continuar con el error normal
-                }
-              }
-              
-              throw new Error(`Error HTTP ${response.status}: ${response.statusText}`);
+            if (response.status === 420 || response.status === 429) {
+              const retryAfter = response.headers.get('Retry-After');
+              const waitTime = retryAfter ? Number.parseInt(retryAfter, 10) : 60;
+              throw new Error(`RATE_LIMIT_ERROR:${waitTime}:general`);
             }
-            
-            // Convertir respuesta a ArrayBuffer
-            const arrayBuffer = await response.arrayBuffer();
-            return arrayBuffer;
-          }, endpoint, method); // Pasar endpoint y method correctamente
-          
-          this.addLog("info", `📊 [downloadAppExcel] Buffer recibido: ${buffer.byteLength} bytes`);
-          
-          // Convertir ArrayBuffer a base64 de forma compatible con navegador y Node
-          let base64: string;
-          if (typeof Buffer !== 'undefined') {
-            // Node.js o Electron
-            base64 = Buffer.from(buffer).toString('base64');
-          } else {
-            // Navegador puro
-            const bytes = new Uint8Array(buffer);
-            let binary = '';
-            for (let i = 0; i < bytes.length; i++) {
-              binary += String.fromCharCode(bytes[i]);
-            }
-            base64 = btoa(binary);
+            const errorText = await response.text();
+            this.addLog("error", `❌ ${excelCounter} Error HTTP ${response.status} al descargar: ${errorText.substring(0, 500)}`);
+            throw new Error(`Error HTTP ${response.status}: ${errorText.substring(0, 200)}`);
           }
           
-          this.addLog("info", `📊 [downloadAppExcel] Base64 generado: ${base64.length} caracteres`);
-          
-          // Guardar el archivo usando el bridge de Electron
-          this.addLog("info", `📊 [downloadAppExcel] Guardando archivo en: ${excelPath}`);
-          const saveResult = await window.electron.fileSystem.saveFile(base64, excelPath);
-          
-          if (!saveResult.success) {
-            this.addLog("error", `❌ Error al guardar Excel: ${saveResult.error}`);
-            throw new Error(`Error al guardar Excel: ${saveResult.error}`);
-          }
-          
-          this.addLog("info", `📊 [downloadAppExcel] Archivo guardado, verificando existencia...`);
-          
-          // Verificar existencia del archivo
-          if (typeof (window.electron.fileSystem as any)?.existsSync === 'function') {
-            const exists = await ((window.electron.fileSystem as any).existsSync(excelPath));
-            if (!exists) {
-              this.addLog("error", `❌ El archivo Excel no se encontró después de descargar: ${excelPath}`);
-              throw new Error(`Archivo Excel no encontrado después de descargar: ${excelPath}`);
-            }
-            
-            this.addLog("success", `✅ Excel oficial descargado exitosamente: ${excelPath}`);
-            
-            // Obtener tamaño del archivo si está disponible
-            if (typeof (window.electron.fileSystem as any)?.getFileSize === 'function') {
-              try {
-                const size = await ((window.electron.fileSystem as any).getFileSize(excelPath));
-                this.addLog("info", `📊 Tamaño del archivo Excel: ${(size / 1024).toFixed(2)} KB`);
-                this.backupStats.downloadedBytes += size;
-              } catch (sizeError) {
-                this.addLog("warning", `⚠️ No se pudo obtener el tamaño del archivo: ${sizeError}`);
-              }
-            }
-          } else {
-            this.addLog("success", `✅ Excel oficial descargado: ${excelPath}`);
-          }
-        } catch (err) {
-          if (err instanceof Error && err.message.startsWith("RATE_LIMIT_ERROR:")) {
-            // Re-lanzar error de rate limit para que se maneje en el nivel superior
-            this.addLog("warning", `⏸️ [downloadAppExcel] Rate limit detectado, se reintentará después`);
-            throw err;
-          }
-          if (err instanceof Error && err.message.startsWith("INVALID_LIMIT_ERROR:")) {
-            // Re-lanzar error de límite inválido
-            this.addLog("error", `❌ [downloadAppExcel] Error de límite inválido: ${err.message}`);
-            throw err;
-          }
-          this.addLog("error", `❌ Error al solicitar o guardar el Excel: ${err instanceof Error ? err.message : String(err)}`);
-          this.addLog("error", `❌ Stack trace: ${err instanceof Error ? err.stack : 'N/A'}`);
-          throw err;
+          const arrayBuffer = await response.arrayBuffer();
+          this.addLog("success", `✅ ${excelCounter} Archivo descargado desde Podio: ${arrayBuffer.byteLength} bytes`);
+          return arrayBuffer;
+        }, endpoint, method);
+        
+        this.addLog("info", `📊 ${excelCounter} Buffer recibido: ${buffer.byteLength} bytes`);
+        
+        if (buffer.byteLength === 0) {
+          this.addLog("error", `❌ ${excelCounter} ERROR CRÍTICO: El buffer está vacío (0 bytes)`);
+          throw new Error(`Buffer vacío al descargar Excel para ${appName}`);
         }
-      } else {
+        
+        // Convertir ArrayBuffer a base64
+        let base64: string;
+        if (typeof Buffer !== 'undefined') {
+          base64 = Buffer.from(buffer).toString('base64');
+          this.addLog("info", `📊 ${excelCounter} Convertido a base64: ${base64.length} caracteres`);
+            } else {
+          const bytes = new Uint8Array(buffer);
+          let binary = '';
+          for (let i = 0; i < bytes.length; i++) {
+            binary += String.fromCharCode(bytes[i]);
+          }
+          base64 = btoa(binary);
+          this.addLog("info", `📊 ${excelCounter} Convertido a base64 (btoa): ${base64.length} caracteres`);
+        }
+        
+        if (!base64 || base64.length === 0) {
+          this.addLog("error", `❌ ${excelCounter} ERROR CRÍTICO: La conversión a base64 falló o está vacía`);
+          throw new Error(`Conversión a base64 falló para ${appName}`);
+        }
+        
+        // Guardar el archivo
+        this.addLog("warning", `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+        this.addLog("warning", `💾 ${excelCounter} GUARDANDO ARCHIVO EN DISCO...`);
+        this.addLog("warning", `💾 ${excelCounter} Ruta: ${excelPath}`);
+        this.addLog("warning", `💾 ${excelCounter} Tamaño base64: ${base64.length} caracteres`);
+        this.addLog("warning", `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+        
+        const saveResult = await window.electron.fileSystem.saveFile(base64, excelPath);
+        
+        this.addLog("info", `📊 ${excelCounter} Resultado de saveFile: success=${saveResult.success}`);
+        if (saveResult.error) {
+          this.addLog("error", `❌ ${excelCounter} Error de saveFile: ${saveResult.error}`);
+        }
+        if (saveResult.path) {
+          this.addLog("info", `📊 ${excelCounter} Ruta retornada por saveFile: ${saveResult.path}`);
+        }
+        
+        if (!saveResult.success) {
+          this.addLog("error", `❌ ${excelCounter} ========== ERROR AL GUARDAR EXCEL ==========`);
+          this.addLog("error", `❌ ${excelCounter} Ruta: ${excelPath}`);
+          this.addLog("error", `❌ ${excelCounter} Error: ${saveResult.error}`);
+          this.addLog("error", `❌ ${excelCounter} ===============================================`);
+          throw new Error(`Error al guardar Excel: ${saveResult.error}`);
+        }
+        
+        this.addLog("success", `✅ ${excelCounter} saveFile completado exitosamente`);
+        
+        // Verificar existencia del archivo INMEDIATAMENTE después de guardar
+        this.addLog("info", `🔍 ${excelCounter} Verificando existencia del archivo...`);
+        if (typeof (window.electron.fileSystem as any)?.existsSync === 'function') {
+          // Esperar un momento para que el sistema de archivos se actualice
+          await new Promise(resolve => setTimeout(resolve, 100));
+          
+          const exists = await ((window.electron.fileSystem as any).existsSync(excelPath));
+          this.addLog("info", `🔍 ${excelCounter} Resultado de existsSync: ${exists}`);
+          
+          if (!exists) {
+            this.addLog("error", `❌ ${excelCounter} ========== ARCHIVO NO ENCONTRADO DESPUÉS DE GUARDAR ==========`);
+            this.addLog("error", `❌ ${excelCounter} Ruta buscada: ${excelPath}`);
+            this.addLog("error", `❌ ${excelCounter} Carpeta base: ${folderPath}`);
+            this.addLog("error", `❌ ${excelCounter} Nombre archivo: ${excelFileName}`);
+            this.addLog("error", `❌ ${excelCounter} ===============================================`);
+            
+            // Intentar verificar si la carpeta existe
+            try {
+              const folderExists = await ((window.electron.fileSystem as any).existsSync(folderPath));
+              this.addLog("info", `🔍 ${excelCounter} Carpeta base existe: ${folderExists}`);
+            } catch (e) {
+              this.addLog("error", `❌ ${excelCounter} Error verificando carpeta: ${e}`);
+            }
+            
+            throw new Error(`Archivo Excel no encontrado después de descargar: ${excelPath}`);
+          }
+          
+          this.addLog("success", `✅ ${excelCounter} Archivo verificado y existe en: ${excelPath}`);
+          
+          // Obtener tamaño del archivo
+          if (typeof (window.electron.fileSystem as any)?.getFileSize === 'function') {
+            try {
+              const size = await ((window.electron.fileSystem as any).getFileSize(excelPath));
+              this.addLog("success", `✅ ${excelCounter} Tamaño del archivo Excel: ${(size / 1024).toFixed(2)} KB (${size} bytes)`);
+              this.backupStats.downloadedBytes += size;
+              
+              if (size === 0) {
+                this.addLog("error", `❌ ${excelCounter} ADVERTENCIA: El archivo tiene 0 bytes`);
+              }
+            } catch (sizeError) {
+              this.addLog("error", `❌ ${excelCounter} Error al obtener tamaño del archivo: ${sizeError}`);
+            }
+          } else {
+            this.addLog("warning", `⚠️ ${excelCounter} getFileSize no está disponible`);
+          }
+        } else {
+          this.addLog("warning", `⚠️ ${excelCounter} existsSync no está disponible, no se puede verificar el archivo`);
+        }
+        
+        const excelEndTime = Date.now();
+        const excelDuration = ((excelEndTime - excelStartTime) / 1000).toFixed(2);
+        this.addLog("success", `✅ ${excelCounter} Excel descargado exitosamente: ${appName} (${excelDuration}s)`);
+        this.addLog("info", `📁 ${excelCounter} Ruta: ${excelPath}`);
+        } else {
         this.addLog("error", "❌ Función de descarga de archivos no disponible en Electron");
         throw new Error("Función de descarga de archivos no disponible");
       }
-      
-      this.addLog("success", `✅ Excel descargado completamente para ${appName}`);
     } catch (error) {
+      // CRÍTICO: Lanzar TODOS los errores para que el proceso se pause
+      // El nivel superior manejará rate limits con pausa automática
+      // Otros errores detendrán el proceso como se requiere
       if (error instanceof Error && error.message.startsWith("RATE_LIMIT_ERROR:")) {
-        // Re-lanzar error de rate limit para que se maneje en el nivel superior
-        // El nivel superior (processApplicationParallel) manejará el rate limit y reintentará
-        this.addLog("warning", `⏸️ [downloadAppExcel] Rate limit detectado, se reintentará después`);
-        throw error;
+        this.addLog("warning", `⏸️ [downloadAppExcel] Rate limit detectado, se pausará y reintentará`);
+        throw error; // Propagar para pausa automática
       }
-      if (error instanceof Error && error.message.startsWith("INVALID_LIMIT_ERROR:")) {
-        // Re-lanzar error de límite inválido (error crítico del código)
-        this.addLog("error", `❌ [downloadAppExcel] Error crítico de límite inválido: ${error.message}`);
-        throw error;
+      if (error instanceof Error && error.message.startsWith("ESCANEO_CANCELADO:")) {
+        this.addLog("warning", `🚫 [downloadAppExcel] Escaneo cancelado`);
+        throw error; // Propagar cancelación
       }
-      // Para otros errores, loguear con más detalle y determinar si son recuperables
+      
+      // Para TODOS los demás errores, lanzar para detener el proceso
       const errorMessage = error instanceof Error ? error.message : String(error);
       const errorStack = error instanceof Error ? error.stack : 'N/A';
       
-      // Errores recuperables (red, timeout, etc.) - continuar sin detener
-      const recoverableErrors = ['ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND', 'network', 'timeout', 'fetch'];
-      const isRecoverable = recoverableErrors.some(pattern => errorMessage.toLowerCase().includes(pattern.toLowerCase()));
+      this.addLog("error", `❌ ${excelCounter} ========== ERROR DESCARGANDO EXCEL ==========`);
+      this.addLog("error", `❌ ${excelCounter} App: ${appName} (ID: ${appId})`);
+      this.addLog("error", `❌ ${excelCounter} Carpeta: ${folderPath}`);
+      this.addLog("error", `❌ ${excelCounter} Archivo: ${excelFileName}`);
+      this.addLog("error", `❌ ${excelCounter} Mensaje: ${errorMessage}`);
+      this.addLog("error", `❌ ${excelCounter} Stack: ${errorStack}`);
+      this.addLog("error", `❌ ${excelCounter} ===============================================`);
+      this.addLog("error", `❌ ${excelCounter} El proceso se PAUSARÁ porque la descarga de Excel falló`);
       
-      if (isRecoverable) {
-        this.addLog("warning", `⚠️ [downloadAppExcel] Error recuperable al exportar Excel para ${appName}: ${errorMessage}`);
-        this.addLog("warning", `⚠️ [downloadAppExcel] Continuando con el escaneo. El Excel se puede descargar después durante el backup.`);
-        // NO lanzar el error para no detener el proceso completo
-      } else {
-        // Errores no recuperables (400, 401, 403, 404, etc.) - loguear con detalle pero continuar
-        this.addLog("error", `❌ [downloadAppExcel] Error al exportar Excel oficial para ${appName}: ${errorMessage}`);
-        this.addLog("error", `❌ [downloadAppExcel] Stack trace: ${errorStack}`);
-        this.addLog("warning", `⚠️ [downloadAppExcel] Continuando con el escaneo aunque el Excel no se descargó. Se puede descargar después durante el backup.`);
-        // NO lanzar el error para no detener el proceso completo, pero loguear con detalle
-      }
+      // Lanzar error para detener el proceso
+      throw error;
     }
   }
 
@@ -2727,28 +3335,198 @@ export class PodioBackupService {
   }
 
   /**
-   * Realizar el respaldo completo (escaneo + descarga de archivos)
-   * Este método puede ser sobrescrito por clases derivadas (como PodioBackupServiceElectron)
+   * Realizar el respaldo completo: descargar archivos usando URLs guardadas durante el escaneo
+   * 
+   * Este método SOLO descarga archivos usando las URLs guardadas en BD durante el escaneo.
+   * NO hace llamadas API adicionales - solo descarga archivos físicamente a sus carpetas.
    * 
    * @param options - Opciones de respaldo (organizaciones, workspaces, apps a incluir)
-   * @param progressCallback - Callback para reportar progreso
+   * @param progressCallback - Callback para reportar progreso durante la descarga
    * @param useLastScan - Si true, intenta reutilizar el último escaneo (< 1 hora)
    * 
+   * @throws Error si no hay datos escaneados en BD o si no se puede cargar scannedFilesComplete
+   * 
    * @remarks
-   * - Primero escanea la estructura (scanBackup con scanOnly=false)
-   * - Luego descarga los archivos encontrados
-   * - Las clases derivadas pueden sobrescribir este método para agregar funcionalidades específicas
+   * **FLUJO DE RESPALDO:**
+   * 1. Carga `scannedFilesComplete` desde BD usando `getLastScanFiles()` y `getLastScanApps()`
+   * 2. Construye la estructura de `scannedFilesComplete` con URLs guardadas
+   * 3. Descarga archivos usando `processCompleteFilesInBatches()` (SOLO descarga, sin API calls)
+   * 4. Descarga Excels oficiales de todas las apps usando Batch API
+   * 5. Actualiza el registro de backup en Podio con estado "Completado"
+   * 
+   * **OPTIMIZACIONES:**
+   * - NO hace llamadas API durante la descarga (usa URLs guardadas)
+   * - Descarga archivo por archivo (Podio no tiene endpoint batch para descarga)
+   * - Procesa archivos en batches de 240 para respetar rate limits
+   * - Las URLs ya fueron obtenidas durante el escaneo usando `/file/app/{app_id}/` (1 llamada por app)
+   * 
+   * **REQUISITOS:**
+   * - Debe existir un escaneo previo con datos guardados en BD
+   * - Las URLs de descarga deben estar guardadas en BD como `download_url`
+   * 
+   * @example
+   * ```typescript
+   * await service.performBackup(
+   *   { organizations: true, workspaces: true, applications: true, items: true, files: true },
+   *   (data) => console.log(`Progreso: ${data.progress}%`),
+   *   false
+   * );
+   * ```
    */
   public async performBackup(
     options: BackupOptions,
     progressCallback?: ProgressCallback,
     useLastScan: boolean = false
   ): Promise<void> {
-    // Primero escanear (con archivos)
-    await this.scanBackup(options, progressCallback, useLastScan, false);
+    this.addLog("info", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    this.addLog("info", "📦 INICIANDO RESPALDO COMPLETO");
+    this.addLog("info", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+      // Verificar autenticación
+      if (!this.authData) {
+        this.addLog("error", "No autenticado. Llama a authenticate() primero.");
+      throw new Error("No autenticado. Llama a authenticate() primero.");
+    }
     
-    // Luego descargar archivos (la lógica de descarga está en el método original)
-    // Nota: La descarga se maneja en el código existente después del escaneo
+    // Cargar datos escaneados desde BD
+    if (typeof window !== 'undefined' && window.electron && window.electron.db) {
+      try {
+        const lastScan = await window.electron.db.getLastScan();
+        if (!lastScan) {
+          this.addLog("error", "❌ No se encontró ningún escaneo previo en BD");
+          this.addLog("error", "❌ Debes ejecutar un escaneo primero antes de realizar el respaldo");
+          throw new Error("No se encontró ningún escaneo previo. Ejecuta un escaneo primero.");
+        }
+        
+        this.addLog("info", `📚 Cargando datos del escaneo ID: ${lastScan.id} (${new Date(lastScan.created_at).toLocaleString()})`);
+        
+        // Cargar archivos y apps desde BD
+        const files = await window.electron.db.getLastScanFiles();
+        const apps = await window.electron.db.getLastScanApps();
+        
+        if (files.length === 0) {
+          this.addLog("warning", "⚠️ No hay archivos para descargar en el escaneo previo");
+        } else {
+          this.addLog("info", `📥 Cargando ${files.length} archivos con URLs guardadas desde BD...`);
+        }
+        
+        // Construir scannedFilesComplete desde BD con URLs guardadas
+        this.scannedFilesComplete = files.map(file => ({
+          file: {
+            file_id: file.file_id,
+            name: file.name,
+            link: file.download_url,
+            mimetype: file.mimetype || '',
+            size: file.size || 0,
+            download_link: file.download_url
+          },
+          downloadUrl: file.download_url, // URL guardada durante el escaneo
+          folderPath: file.folder_path,
+          appName: apps.find(a => a.app_id === file.app_id)?.app_name || 'Unknown'
+        }));
+        
+        // Construir scannedApps desde BD
+        this.scannedApps = apps.map(app => ({
+          appId: app.app_id,
+          folderPath: app.folder_path,
+          appName: app.app_name
+        }));
+        
+        this.addLog("success", `✅ Datos cargados desde BD: ${apps.length} apps, ${files.length} archivos con URLs guardadas`);
+        
+        // Verificar que todas las URLs estén disponibles
+        const filesWithoutUrl = this.scannedFilesComplete.filter(f => !f.downloadUrl || f.downloadUrl === '');
+        if (filesWithoutUrl.length > 0) {
+          this.addLog("warning", `⚠️ ${filesWithoutUrl.length} archivos no tienen URL de descarga guardada`);
+          this.addLog("warning", `⚠️ Estos archivos se omitirán durante la descarga`);
+          // Filtrar archivos sin URL
+          this.scannedFilesComplete = this.scannedFilesComplete.filter(f => f.downloadUrl && f.downloadUrl !== '');
+        }
+        
+      } catch (dbError) {
+        this.addLog("error", `❌ Error cargando datos desde BD: ${dbError instanceof Error ? dbError.message : String(dbError)}`);
+        throw new Error(`No se pudieron cargar los datos del escaneo: ${dbError instanceof Error ? dbError.message : String(dbError)}`);
+      }
+    } else {
+      this.addLog("error", "❌ Electron DB no disponible. No se pueden cargar datos del escaneo.");
+      throw new Error("Electron DB no disponible");
+    }
+    
+    // Verificar que hay datos para descargar
+    if (this.scannedFilesComplete.length === 0 && this.scannedApps.length === 0) {
+      this.addLog("error", "❌ No hay datos para descargar. El escaneo previo no tiene archivos ni apps.");
+      throw new Error("No hay datos para descargar. Ejecuta un escaneo primero.");
+    }
+    
+    // PASO 1: Descargar archivos usando URLs guardadas (SIN llamadas API)
+    if (this.scannedFilesComplete.length > 0) {
+      this.addLog("info", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+      this.addLog("info", `📥 PASO 1: Descargando ${this.scannedFilesComplete.length} archivos usando URLs guardadas...`);
+      this.addLog("info", "📥 NOTA: No se harán llamadas API adicionales - solo descarga física de archivos");
+      await this.processCompleteFilesInBatches(progressCallback);
+    } else {
+      this.addLog("info", "ℹ️ No hay archivos para descargar");
+    }
+    
+    // PASO 2: Descargar Excels oficiales usando Batch API (solo si no fueron descargados durante el escaneo)
+    if (this.scannedApps.length > 0) {
+      this.addLog("info", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+      this.addLog("info", `📊 PASO 2: Verificando y descargando Excels oficiales de ${this.scannedApps.length} apps usando Batch API...`);
+      let excelIndex = 0;
+      let skippedCount = 0;
+      
+      for (const app of this.scannedApps) {
+        try {
+          // Verificar si el Excel ya existe (fue descargado durante el escaneo)
+          const excelFileName = `${this.sanitizeFileName(app.appName)}_oficial.xlsx`;
+          const excelPath = `${app.folderPath}/${excelFileName}`;
+          
+          if (typeof window !== 'undefined' && window.electron && typeof (window.electron.fileSystem as any)?.existsSync === 'function') {
+            const exists = await ((window.electron.fileSystem as any).existsSync(excelPath));
+            if (exists) {
+              this.addLog("info", `⏭️ [Excel ${excelIndex + 1}/${this.scannedApps.length}] Excel ya existe, omitiendo: ${app.appName}`);
+              this.addLog("info", `📁 Ruta: ${excelPath}`);
+              skippedCount++;
+              excelIndex++;
+              continue;
+            }
+          }
+          
+          // Excel no existe, descargarlo
+          await this.downloadAppExcel(app.appId, app.folderPath, app.appName, progressCallback, excelIndex, this.scannedApps.length);
+          excelIndex++;
+        } catch (error) {
+          this.addLog("error", `❌ Error descargando Excel para ${app.appName}: ${error instanceof Error ? error.message : String(error)}`);
+          // Continuar con la siguiente app
+          excelIndex++;
+        }
+      }
+      
+      if (skippedCount > 0) {
+        this.addLog("info", `ℹ️ ${skippedCount} Excel(s) ya existían y fueron omitidos (descargados durante el escaneo)`);
+      }
+    } else {
+      this.addLog("info", "ℹ️ No hay apps para descargar Excel");
+    }
+    
+    // PASO 3: Actualizar registro de backup en Podio
+    this.addLog("info", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    this.addLog("info", "📝 PASO 3: Actualizando registro de backup en Podio...");
+    try {
+      await this.updateBackupRecord(true);
+      this.addLog("success", "✅ Registro de backup actualizado en Podio");
+    } catch (error) {
+      this.addLog("error", `❌ Error actualizando registro de backup: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    
+    // Finalizar
+          if (progressCallback) {
+      this.updateProgress(100, "Respaldo completado.", progressCallback);
+    }
+    
+    this.addLog("success", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    this.addLog("success", "✅ RESPALDO COMPLETO FINALIZADO");
+    this.addLog("success", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   }
 
   /**
@@ -2776,29 +3554,7 @@ export class PodioBackupService {
     await this.scanBackup(options, progressCallback, false, false);
   }
 
-  // MÃ©todo original eliminado - ahora usa scanBackupImpl del mÃ³dulo separado
-  /*
-  private async scanBackup_OLD(
-    options: BackupOptions, 
-    progressCallback?: ProgressCallback,
-    useLastScan: boolean = false,
-    scanOnly: boolean = true
-  ): Promise<void> {
-    // Reiniciar flags al inicio
-    this.isScanCancelled = false;
-    this.isScanning = true; // Activar modo escaneo (desactiva cachÃ©)
-    
-    // ========================================================================
-    // DETECCIÃ“N AUTOMÃTICA DE ESCANEO INCOMPLETO (SOLO SI NO ES useLastScan)
-    // ========================================================================
-    if (!useLastScan && typeof window !== 'undefined' && window.electron && window.electron.db) {
-      const lastScan = await window.electron.db.getLastScan();
-      if (lastScan && !lastScan.summary) {
-        // Verificar si el escaneo fue cancelado
-        const isCancelled = lastScan.cancelled === 1 || lastScan.cancelled === true;
-        
-        if (isCancelled) {
-          // El escaneo fue cancelado, NO reanudar automÃ¡ticamente, crear nuevo scan
+  /**
           this.addLog("info", `âš ï¸ Se detectÃ³ un escaneo cancelado anteriormente (ID: ${lastScan.id}). Iniciando nuevo escaneo desde cero.`);
           // Continuar con el flujo normal para crear un nuevo scan
         } else {
@@ -3065,7 +3821,7 @@ export class PodioBackupService {
               this.addLog("info", "âš ï¸ Los datos ya escaneados no se volverÃ¡n a procesar cuando reanudes.");
               
               // PAUSAR para acciÃ³n manual cuando useLastScan=true
-              if (progressCallback) {
+            if (progressCallback) {
                 this.updateProgress(1, `â¸ï¸ Escaneo incompleto detectado. Presiona "Reanudar Escaneo" para continuar desde donde quedÃ³.`, progressCallback);
               }
               
@@ -3162,12 +3918,12 @@ export class PodioBackupService {
       
       // Notificar progreso inicial
       try {
-        if (progressCallback) {
+      if (progressCallback) {
           this.updateProgress(1, `Escaneando... (0 apps, 0 items, 0 archivos, 0.00 GB)`, progressCallback);
-        }
-      } catch (error) {
+      }
+    } catch (error) {
         this.addLog("error", `âŒ ERROR en updateProgress: ${error instanceof Error ? error.message : String(error)}`);
-        throw error;
+      throw error;
       }
 
       // ========================================================================
@@ -3278,46 +4034,39 @@ export class PodioBackupService {
           for (let k = 0; k < applications.length; k++) {
             const app = applications[k];
             this.addLog("info", `--- INICIO app (${k + 1}/${applications.length}): ${app.name} ---`);
-            this.addLog("info", `Llamando a getItems para app_id=${app.app_id} (${app.name})...`);
-            let items: PodioItem[] = [];
+            this.addLog("info", `Llamando a getItemsCount para app_id=${app.app_id} (${app.name})...`);
+            let itemsCount = 0;
             try {
-              items = await this.getItems(app.app_id);
-              this.addLog("info", `getItems OK: ${items.length} items encontrados en app ${app.name} (${app.app_id})`);
+              itemsCount = await this.getItemsCount(app.app_id);
+              this.addLog("info", `getItemsCount OK: ${itemsCount} items encontrados en app ${app.name} (${app.app_id})`);
             } catch (err) {
-              this.addLog("error", `Error en getItems para app ${app.name} (${app.app_id}): ${err instanceof Error ? err.message : String(err)}`);
+              this.addLog("error", `Error en getItemsCount para app ${app.name} (${app.app_id}): ${err instanceof Error ? err.message : String(err)}`);
               continue;
             }
-            this.backupCounts.items += items.length;
-            this.backupStats.items += items.length;
-            totalItems += items.length;
+            this.backupCounts.items += itemsCount;
+            this.backupStats.items += itemsCount;
+            totalItems += itemsCount;
             // Crear carpeta para la app
             const folderPath = await this.createFolderStructure(org.name, workspace.name, app.name);
             // Guardar tarea de Excel para despuÃ©s (en memoria)
             this.scannedApps.push({ appId: app.app_id, folderPath, appName: app.name });
             
-            // Acumular archivos para procesar en batches
+            // OPTIMIZACIÓN: Usar /file/app/{app_id}/ para obtener todos los archivos de una vez
+            // Esto es mucho más eficiente que iterar por cada item
+            this.addLog("info", `📥 [${app.name}] Obteniendo archivos de la app (app_id: ${app.app_id})...`);
             const appFiles: PodioFile[] = [];
-            
-            // Recorrer cada item y obtener archivos adjuntos
-            for (let m = 0; m < items.length; m++) {
-              const item = items[m];
-              this.addLog("info", `  [${m + 1}/${items.length}] Llamando a getItemFiles para item_id=${item.item_id} (${item.title})...`);
-              let files: PodioFile[] = [];
-              try {
-                files = await this.getItemFiles(item.item_id);
-                this.addLog("info", `  getItemFiles OK: ${files.length} archivos encontrados en item ${item.item_id}`);
-              } catch (err) {
-                this.addLog("error", `  Error en getItemFiles para item ${item.item_id}: ${err instanceof Error ? err.message : String(err)}`);
-                continue;
-              }
-              for (const file of files) {
+            try {
+              const allFiles = await this.getAppFiles(app.app_id);
+              this.addLog("info", `📊 [${app.name}] Archivos obtenidos: ${allFiles.length} archivos`);
+              
+              for (const file of allFiles) {
                 if (isTestMode() && totalFiles >= TEST_LIMIT) break;
                 
-                // OPTIMIZACIÃ“N: Obtener TODA la informaciÃ³n necesaria durante el escaneo
+                // OPTIMIZACIÓN: Obtener TODA la información necesaria durante el escaneo
                 let fileSize = file.size;
-                let downloadUrl = file.link;
+                let downloadUrl = file.download_link || file.link;
                 
-                // Si falta el tamaÃ±o, obtenerlo desde el endpoint de archivo
+                // Si falta el tamaño, obtenerlo desde el endpoint de archivo
                 if (!fileSize || fileSize === 0) {
                   try {
                     const fileInfo = await this.apiRequest<any>(`/file/${file.file_id}`);
@@ -3326,7 +4075,7 @@ export class PodioBackupService {
                       file.size = fileSize; // Actualizar en memoria
                     }
                   } catch (e) {
-                    this.addLog("warning", `No se pudo obtener el tamaÃ±o para el archivo ${file.name} (${file.file_id})`);
+                    this.addLog("warning", `No se pudo obtener el tamaño para el archivo ${file.name} (${file.file_id})`);
                   }
                 }
                 
@@ -3341,65 +4090,12 @@ export class PodioBackupService {
                   }
                 }
                 
-                // Almacenar informaciÃ³n completa para evitar duplicaciÃ³n en descarga
+                // Almacenar información completa para evitar duplicación en descarga
                 const filesFolder = `${folderPath}/files`;
                 this.scannedFilesComplete.push({
                   file: file,
                   downloadUrl: downloadUrl,
                   folderPath: filesFolder,
-                  appName: app.name
-                });
-                
-                // Mantener compatibilidad con cÃ³digo existente
-                appFiles.push(file);
-                this.scannedFiles.push(file);
-                this.backupCounts.files++;
-                this.backupStats.files++;
-                this.backupStats.backupSize += fileSize / (1024 * 1024 * 1024); // Sumar en GB
-                totalFiles++;
-                this.addLog("info", `    Archivo completo preparado: ${file.name} (${fileSize} bytes)`);
-              }
-              if (isTestMode() && totalFiles >= TEST_LIMIT) break;
-            }
-            
-            // Procesar archivos de esta app en batches
-            if (appFiles.length > 0) {
-              const filesFolder = `${folderPath}/files`;
-              await this.processFilesInBatches(appFiles, filesFolder, progressCallback);
-            }
-            totalProgress += progressPerApp;
-            if (progressCallback) {
-              this.updateProgress(totalProgress, `Descarga de archivos para ${app.name}...`, progressCallback);
-            }
-          }
-        }
-      }
-      
-      // Finalizar escaneo con datos consolidados
-      this.totalFilesToDownload = this.scannedFiles.length;
-      // Guardar los stats escaneados
-      this.scannedStats = { ...this.backupStats };
-      // Finalizar escaneo
-      const totalBytes = this.backupStats.backupSize * 1024 * 1024 * 1024;
-      this.addLog("success", `Escaneo de respaldo completado. TamaÃ±o total: ${totalBytes} bytes (${this.backupStats.backupSize.toFixed(2)} GB)`);
-      this.addLog("info", `Organizaciones: ${this.backupCounts.organizations}`);
-      this.addLog("info", `Espacios de trabajo: ${this.backupCounts.workspaces}`);
-      this.addLog("info", `Aplicaciones: ${this.backupCounts.applications}`);
-      this.addLog("info", `Elementos: ${this.backupCounts.items}`);
-      this.addLog("info", `Archivos encontrados: ${this.backupCounts.files}`);
-      this.addLog("info", `TamaÃ±o estimado: ${this.backupStats.backupSize.toFixed(2)} GB`);
-      await this.updateEstimatedSizeInBackupRecord();
-      // ACTUALIZAR EL ITEM DE BACKUP EN PODIO CON LOS DATOS DEL ESCANEO
-      await this.updateBackupRecord(false);
-      if (progressCallback) {
-        this.updateProgress(99, "Escaneo completado. Listo para descargar.", progressCallback);
-      }
-    } catch (error) {
-      this.addLog("error", `Error durante el escaneo: ${error instanceof Error ? error.message : String(error)}`);
-      throw error;
-    }
-  }
-
   /**
    * Actualiza el estado del respaldo en el item de backup en Podio
    * 
