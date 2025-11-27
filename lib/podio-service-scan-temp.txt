@@ -1,0 +1,807 @@
+﻿  /**
+   * PROCESO DE ESCANEO CON MANEJO DE RATE LIMITS Y REINTENTOS AUTOMÃTICOS
+   * ========================================================================
+   * Este mÃ©todo escanea toda la estructura de Podio (organizaciones, workspaces, apps, items, archivos)
+   * y guarda la informaciÃ³n en BD para su uso posterior en el respaldo.
+   * 
+   * CARACTERÃSTICAS:
+   * 1. DetecciÃ³n automÃ¡tica de rate limits (420/429) de la API de Podio
+   * 2. Pausa automÃ¡tica cuando se alcanza el lÃ­mite de tasa
+   * 3. Reintentos automÃ¡ticos despuÃ©s del tiempo de espera (cronÃ³metro regresivo)
+   * 4. Guardado incremental en BD para recuperaciÃ³n en caso de errores
+   * 5. ReutilizaciÃ³n de escaneos recientes (< 1 hora) si se solicita
+   * 
+   * FLUJO DE RATE LIMITS:
+   * - Si la API responde con error 420/429, se guarda el estado en BD
+   * - Se calcula el tiempo de espera real desde el primer request de la hora
+   * - Se pausa automÃ¡ticamente mostrando cronÃ³metro regresivo
+   * - DespuÃ©s del tiempo de espera, se reintenta automÃ¡ticamente
+   * - El proceso continÃºa desde donde se quedÃ³ (sin perder progreso)
+   * 
+   * @param options - Opciones de respaldo (organizaciones, workspaces, apps a incluir)
+   * @param progressCallback - Callback para reportar progreso
+   * @param useLastScan - Si true, intenta reutilizar el Ãºltimo escaneo (< 1 hora)
+   */
+  async scanBackup(
+    options: BackupOptions, 
+    progressCallback?: ProgressCallback, 
+    useLastScan: boolean = false,
+    scanOnly: boolean = true  // NUEVO: por defecto solo escanea estructura (modo rÃ¡pido)
+  ): Promise<void> {
+    // Reiniciar flags al inicio
+    this.isScanCancelled = false;
+    this.isScanning = true; // Activar modo escaneo (desactiva cachÃ©)
+    
+    // ========================================================================
+    // DETECCIÃ“N AUTOMÃTICA DE ESCANEO INCOMPLETO (SOLO SI NO ES useLastScan)
+    // ========================================================================
+    // Si NO es useLastScan, detectar automÃ¡ticamente y CONTINUAR automÃ¡ticamente
+    // Si ES useLastScan, la detecciÃ³n se hace mÃ¡s abajo y se pausa para acciÃ³n manual
+    // IMPORTANTE: NO reanudar si el escaneo fue cancelado (cancelled = true)
+    if (!useLastScan && typeof window !== 'undefined' && window.electron && window.electron.db) {
+      const lastScan = await window.electron.db.getLastScan();
+      if (lastScan && !lastScan.summary) {
+        // Verificar si el escaneo fue cancelado
+        const isCancelled = lastScan.cancelled === 1 || lastScan.cancelled === true;
+        
+        if (isCancelled) {
+          // El escaneo fue cancelado, NO reanudar automÃ¡ticamente, crear nuevo scan
+          this.addLog("info", `â„¹ï¸ Se detectÃ³ un escaneo cancelado anteriormente (ID: ${lastScan.id}). Iniciando nuevo escaneo desde cero.`);
+          // Continuar con el flujo normal para crear un nuevo scan
+        } else {
+          // El escaneo no estÃ¡ finalizado (no tiene summary) y NO fue cancelado, significa que se interrumpiÃ³ (rate limit, etc.)
+          this.addLog("warning", `ðŸ”„ Se detectÃ³ un escaneo incompleto (ID: ${lastScan.id}, fecha: ${new Date(lastScan.created_at_ms).toLocaleString()})`);
+          this.addLog("info", "ðŸ”„ Reanudando escaneo automÃ¡ticamente desde donde quedÃ³...");
+          
+          // Cargar datos parciales del escaneo incompleto
+          const apps = await window.electron.db.getLastScanApps();
+          const files = await window.electron.db.getLastScanFiles();
+          const itemsCount = await window.electron.db.getLastScanItemsCount();
+          
+          this.currentScanId = lastScan.id;
+          
+          // Cargar checkpoint desde BD para saber exactamente dÃ³nde quedÃ³
+          const savedCheckpoint = await window.electron.db.getScanCheckpoint(lastScan.id);
+          if (savedCheckpoint) {
+            this.processingCheckpoint = {
+            orgIndex: savedCheckpoint.orgIndex,
+            orgTotal: savedCheckpoint.orgTotal,
+            workspaceIndex: savedCheckpoint.workspaceIndex,
+            workspaceTotal: savedCheckpoint.workspaceTotal,
+            appIndex: savedCheckpoint.appIndex,
+            appTotal: savedCheckpoint.appTotal,
+            organizations: [], // Se poblarÃ¡ cuando se carguen las organizaciones
+            workspacesCounted: savedCheckpoint.workspacesCounted || false,
+            appsCounted: savedCheckpoint.appsCounted || false
+          };
+          this.addLog("success", `ðŸ”– Checkpoint restaurado: Org ${savedCheckpoint.orgIndex + 1}/${savedCheckpoint.orgTotal}, Workspace ${savedCheckpoint.workspaceIndex + 1}/${savedCheckpoint.workspaceTotal}, App ${savedCheckpoint.appIndex + 1}/${savedCheckpoint.appTotal}`);
+          this.addLog("info", "ðŸ”„ Continuando automÃ¡ticamente desde el checkpoint...");
+        } else {
+          this.addLog("info", "â„¹ï¸ No se encontrÃ³ checkpoint guardado. El escaneo continuarÃ¡ desde el principio.");
+        }
+        
+        // Poblar datos en memoria desde el escaneo incompleto
+        this.scannedApps = apps.map(app => ({
+          appId: app.app_id,
+          folderPath: app.folder_path,
+          appName: app.app_name
+        }));
+        
+        this.scannedFilesComplete = files.map(file => ({
+          file: {
+            file_id: file.file_id,
+            name: file.name,
+            link: file.download_url,
+            mimetype: file.mimetype || '',
+            size: file.size || 0,
+            download_link: file.download_url
+          },
+          downloadUrl: file.download_url,
+          folderPath: file.folder_path,
+          appName: apps.find(a => a.app_id === file.app_id)?.app_name || 'Unknown'
+        }));
+        
+        // Actualizar contadores desde los datos cargados
+        this.backupCounts.applications = apps.length;
+        this.backupCounts.items = itemsCount;
+        this.backupCounts.files = files.length;
+        
+        this.addLog("success", `ðŸ“¦ Escaneo incompleto cargado: ${apps.length} apps, ${itemsCount} items, ${files.length} archivos`);
+        this.addLog("info", "â„¹ï¸ Los datos ya escaneados no se volverÃ¡n a procesar. Continuando desde el checkpoint...");
+        
+        // NO retornar aquÃ­ - continuar automÃ¡ticamente con el escaneo desde el checkpoint
+      }
+    }
+    
+    // ========================================================================
+    // LIMPIAR CHECKPOINTS AL INICIAR NUEVO ESCANEO (solo si no hay escaneo incompleto)
+    // ========================================================================
+    if (!this.currentScanId) {
+      this.processingCheckpoint = null;
+      this.addLog("info", "ðŸ”– Checkpoints limpiados: Iniciando nuevo escaneo desde cero");
+    } else {
+      this.addLog("info", "ðŸ”– Checkpoints preservados: Continuando escaneo incompleto")
+    }
+    
+    // ========================================================================
+    // LIMPIAR RATE LIMITS AL INICIAR ESCANEO (USUARIO DECIDIÃ“ CONTINUAR)
+    // ========================================================================
+    if (typeof window !== 'undefined' && window.electron && window.electron.db) {
+      try {
+        await window.electron.db.clearRateLimitStatus('general')
+        await window.electron.db.clearRateLimitStatus('rateLimited')
+        this.activeRateLimit = null // Limpiar tambiÃ©n el rate limit en memoria
+        this.addLog("info", "ðŸ”„ Rate limits limpiados al iniciar escaneo...")
+      } catch (error) {
+        this.addLog("warning", `No se pudieron limpiar rate limits: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    
+    // ========================================================================
+    // PASO 1: CREAR REGISTRO DE BACKUP EN PODIO (CON REINTENTOS AUTOMÃTICOS)
+    // ========================================================================
+    // IMPORTANTE: Intentar crear el item en Podio primero. Si hay rate limit,
+    // pausar automÃ¡ticamente, esperar el tiempo necesario y reintentar.
+    let createBackupAttempts = 0;
+    const MAX_CREATE_BACKUP_ATTEMPTS = 3;
+    
+    while (createBackupAttempts < MAX_CREATE_BACKUP_ATTEMPTS) {
+      try {
+        this.addLog("info", `ðŸ“ Intentando crear registro de backup en Podio (intento ${createBackupAttempts + 1}/${MAX_CREATE_BACKUP_ATTEMPTS})...`);
+        await this.createBackupRecord();
+        this.addLog("success", `âœ… Registro de backup creado exitosamente en Podio`);
+        break; // Ã‰xito, salir del loop
+      } catch (error) {
+        createBackupAttempts++;
+        
+        // Si hay un error de rate limit al crear el item, pausar y reintentar automÃ¡ticamente
+        if (error instanceof Error && error.message.startsWith("RATE_LIMIT_ERROR:")) {
+          const parts = error.message.split(":");
+          const waitTime = Number.parseInt(parts[1], 10) || 60;
+          const limitType = parts[2] || 'general';
+          
+          this.addLog("warning", `â›” Rate limit detectado al crear registro de backup`);
+          this.addLog("info", `â° Esperando ${Math.ceil(waitTime / 60)} minutos y reintentando automÃ¡ticamente...`);
+          
+          if (progressCallback) {
+            this.updateProgress(1, `â° Pausa por rate limit. Esperando ${Math.ceil(waitTime / 60)} min... (ReintentarÃ¡ automÃ¡ticamente)`, progressCallback);
+          }
+          
+          // Esperar el tiempo necesario con progreso visual
+          await this.waitForRateLimit(waitTime, limitType as 'general' | 'rateLimited');
+          
+          // Verificar si quedan intentos
+          if (createBackupAttempts < MAX_CREATE_BACKUP_ATTEMPTS) {
+            this.addLog("info", `ðŸ”„ Reintentando crear registro de backup...`);
+            continue; // Reintentar
+          } else {
+            this.addLog("error", `âŒ No se pudo crear el registro de backup despuÃ©s de ${MAX_CREATE_BACKUP_ATTEMPTS} intentos`);
+            throw new Error(`No se pudo crear el registro de backup despuÃ©s de ${MAX_CREATE_BACKUP_ATTEMPTS} intentos debido a rate limits`);
+          }
+        }
+        
+        // Si es otro tipo de error, lanzarlo inmediatamente
+        this.addLog("error", `âŒ Error al crear registro de backup: ${error instanceof Error ? error.message : String(error)}`);
+        throw error;
+      }
+    }
+    
+    // IMPORTANTE: Solo verificar escaneo reciente si el usuario lo solicita explÃ­citamente
+    // Si es un nuevo backup (useLastScan = false), SIEMPRE hacer un escaneo nuevo
+    if (useLastScan && typeof window !== 'undefined' && window.electron && window.electron.db) {
+      try {
+        const lastScan = await window.electron.db.getLastScan();
+        if (lastScan) {
+          const scanAge = Date.now() - lastScan.created_at_ms;
+          const oneHour = 60 * 60 * 1000;
+          
+          // Cargar datos del escaneo para verificar si tiene datos vÃ¡lidos
+            const apps = await window.electron.db.getLastScanApps();
+            const files = await window.electron.db.getLastScanFiles();
+            const itemsCount = await window.electron.db.getLastScanItemsCount();
+            
+            // IMPORTANTE: Si el escaneo reciente estÃ¡ vacÃ­o (0 apps y 0 archivos), hacer un escaneo nuevo
+            if (apps.length === 0 && files.length === 0 && itemsCount === 0) {
+              this.addLog("warning", `âš ï¸ Escaneo reciente encontrado pero estÃ¡ vacÃ­o (0 apps, 0 items, 0 archivos). Haciendo escaneo nuevo...`);
+              // Continuar con el escaneo normal, no retornar
+          } else if (lastScan.summary) {
+            // Escaneo COMPLETO (tiene summary) - solo cargar y usar, no reanudar
+            this.addLog("info", `âœ… Escaneo completo encontrado (${Math.round(scanAge / 60000)} minutos). Cargando desde BD...`);
+              
+              this.scannedApps = apps.map(app => ({
+                appId: app.app_id,
+                folderPath: app.folder_path,
+                appName: app.app_name
+              }));
+              
+              this.scannedFilesComplete = files.map(file => ({
+                file: {
+                  file_id: file.file_id,
+                  name: file.name,
+                  link: file.download_url,
+                  mimetype: file.mimetype || '',
+                  size: file.size || 0,
+                  download_link: file.download_url
+                },
+                downloadUrl: file.download_url,
+                folderPath: file.folder_path,
+                appName: apps.find(a => a.app_id === file.app_id)?.app_name || 'Unknown'
+              }));
+              
+              this.scannedFiles = this.scannedFilesComplete.map(sf => sf.file);
+              this.currentScanId = lastScan.id;
+              
+                this.scannedStats = {
+                  apps: lastScan.summary.applications || apps.length,
+                  items: lastScan.summary.items || itemsCount,
+                  workspaces: lastScan.summary.workspaces || 0,
+                  files: lastScan.summary.files || files.length,
+                  backupSize: lastScan.summary.backupSize || 0,
+                  successfulBackups: 0,
+                  backupWarnings: 0,
+                  downloadedFiles: 0,
+                  downloadedBytes: 0
+                };
+              
+            this.addLog("success", `âœ… Escaneo completo cargado desde BD: ${apps.length} apps, ${itemsCount} items, ${files.length} archivos`);
+              
+              if (progressCallback) {
+              this.updateProgress(100, `âœ… Escaneo completado desde BD: ${apps.length} apps, ${itemsCount} items, ${files.length} archivos`, progressCallback);
+              }
+              
+              return; // No hacer escaneo nuevo, usar el de BD
+          } else {
+            // Escaneo INCOMPLETO (no tiene summary) - verificar si fue cancelado
+            const isCancelled = lastScan.cancelled === 1 || lastScan.cancelled === true;
+            
+            if (isCancelled) {
+              // El escaneo fue cancelado, NO reanudar, crear nuevo scan
+              this.addLog("info", `â„¹ï¸ El escaneo anterior fue cancelado (ID: ${lastScan.id}). Iniciando nuevo escaneo desde cero.`);
+              // Continuar con el flujo normal para crear un nuevo scan
+            } else {
+              // Escaneo INCOMPLETO (no tiene summary) y NO fue cancelado - cargar datos parciales y PAUSAR para acciÃ³n manual
+              this.addLog("warning", `ðŸ”„ Escaneo incompleto encontrado (ID: ${lastScan.id}, ${Math.round(scanAge / 60000)} minutos).`);
+              
+              // Cargar datos parciales del escaneo incompleto
+              this.currentScanId = lastScan.id;
+            
+            // Cargar checkpoint desde BD para saber exactamente dÃ³nde quedÃ³
+            const savedCheckpoint = await window.electron.db.getScanCheckpoint(lastScan.id);
+            if (savedCheckpoint) {
+              this.processingCheckpoint = {
+                orgIndex: savedCheckpoint.orgIndex,
+                orgTotal: savedCheckpoint.orgTotal,
+                workspaceIndex: savedCheckpoint.workspaceIndex,
+                workspaceTotal: savedCheckpoint.workspaceTotal,
+                appIndex: savedCheckpoint.appIndex,
+                appTotal: savedCheckpoint.appTotal,
+                organizations: [],
+                workspacesCounted: savedCheckpoint.workspacesCounted || false,
+                appsCounted: savedCheckpoint.appsCounted || false
+              };
+              this.addLog("success", `ðŸ”– Checkpoint encontrado: Org ${savedCheckpoint.orgIndex + 1}/${savedCheckpoint.orgTotal}, Workspace ${savedCheckpoint.workspaceIndex + 1}/${savedCheckpoint.workspaceTotal}, App ${savedCheckpoint.appIndex + 1}/${savedCheckpoint.appTotal}`);
+            }
+            
+            // Poblar datos en memoria desde el escaneo incompleto
+            this.scannedApps = apps.map(app => ({
+              appId: app.app_id,
+              folderPath: app.folder_path,
+              appName: app.app_name
+            }));
+            
+            this.scannedFilesComplete = files.map(file => ({
+              file: {
+                file_id: file.file_id,
+                name: file.name,
+                link: file.download_url,
+                mimetype: file.mimetype || '',
+                size: file.size || 0,
+                download_link: file.download_url
+              },
+              downloadUrl: file.download_url,
+              folderPath: file.folder_path,
+              appName: apps.find(a => a.app_id === file.app_id)?.app_name || 'Unknown'
+            }));
+            
+            this.scannedFiles = this.scannedFilesComplete.map(sf => sf.file);
+            
+            // Actualizar contadores desde los datos cargados
+            this.backupCounts.applications = apps.length;
+            this.backupCounts.items = itemsCount;
+            this.backupCounts.files = files.length;
+            
+              this.addLog("success", `ðŸ“¦ Escaneo incompleto cargado: ${apps.length} apps, ${itemsCount} items, ${files.length} archivos`);
+              this.addLog("warning", `â¸ï¸ ESCANEO INCOMPLETO DETECTADO - Presiona "Reanudar Escaneo" para continuar desde donde quedÃ³`);
+              this.addLog("info", "â„¹ï¸ Los datos ya escaneados no se volverÃ¡n a procesar cuando reanudes.");
+              
+              // PAUSAR para acciÃ³n manual cuando useLastScan=true
+              if (progressCallback) {
+                this.updateProgress(1, `â¸ï¸ Escaneo incompleto detectado. Presiona "Reanudar Escaneo" para continuar desde donde quedÃ³.`, progressCallback);
+              }
+              
+              // Retornar para pausar y esperar acciÃ³n manual del usuario
+              return;
+            }
+          }
+        }
+      } catch (error) {
+        this.addLog("warning", `Error verificando escaneo reciente: ${error instanceof Error ? error.message : String(error)}`);
+        // Continuar con escaneo normal si hay error
+      }
+    }
+    
+    // OPTIMIZACIÃ“N: Generar timestamp Ãºnico para este backup
+    this.backupTimestamp = this.generateBackupTimestamp();
+    const backupPathWithTimestamp = `${this.backupPath}/${this.backupTimestamp}`;
+    this.addLog("info", `ðŸ“ Carpeta de backup Ãºnica: ${backupPathWithTimestamp}`);
+    
+    // Limpiar cachÃ© expirado al inicio de un nuevo escaneo
+    if (typeof window !== 'undefined' && window.electron && window.electron.db) {
+      await window.electron.db.clearExpiredApiCache();
+    }
+    
+    try {
+      this.addLog("info", "Iniciando escaneo de respaldo...");
+      
+      // Iniciar escaneo en BD si estÃ¡ disponible
+      if (typeof window !== 'undefined' && window.electron && window.electron.db) {
+        try {
+          // Log para debug: verificar que backupItemId estÃ© disponible
+          console.log(`ðŸ” scanBackup: this.backupItemId = ${this.backupItemId}`);
+          this.addLog("info", `ðŸ“¦ Iniciando escaneo en BD con podio_backup_item_id: ${this.backupItemId || 'NO DEFINIDO'}`);
+          
+          const scanResult = await window.electron.db.beginScan({
+            user: undefined, // Usuario se puede obtener desde Podio si es necesario
+            org_id: undefined,
+            podio_backup_item_id: this.backupItemId || undefined,
+            title: `Backup scan - ${new Date().toISOString()}`
+          });
+          if (scanResult.success && scanResult.scanId) {
+            this.currentScanId = scanResult.scanId;
+            this.addLog("info", `ðŸ“¦ Escaneo iniciado en BD (ID: ${this.currentScanId}, podio_backup_item_id: ${this.backupItemId || 'N/A'})`);
+            console.log(`âœ… Escaneo iniciado: scan_id=${scanResult.scanId}, podio_backup_item_id=${this.backupItemId}`);
+          } else {
+            console.error(`âŒ Error iniciando escaneo:`, scanResult);
+            this.addLog("error", `âŒ No se pudo iniciar el escaneo en BD`);
+          }
+        } catch (dbError) {
+          console.error('âŒ Error iniciando escaneo en BD:', dbError);
+          this.addLog("error", `âŒ Error iniciando escaneo en BD: ${dbError instanceof Error ? dbError.message : String(dbError)}`);
+        }
+      }
+      
+      // Mostrar informaciÃ³n del modo de prueba si estÃ¡ activo
+      if (isTestMode()) {
+        this.addLog("warning", "ðŸ§ª ========== MODO DE PRUEBA ACTIVO ==========");
+        this.addLog("warning", `ðŸ§ª Workspaces: ${TEST_MODE_CONFIG.workspacesPercent}% (mÃ¡x ${TEST_MODE_CONFIG.maxWorkspaces})`);
+        this.addLog("warning", `ðŸ§ª Aplicaciones: ${TEST_MODE_CONFIG.applicationsPercent}% (mÃ¡x ${TEST_MODE_CONFIG.maxApps})`);
+        this.addLog("warning", `ðŸ§ª Items: ${TEST_MODE_CONFIG.itemsPercent}% (mÃ¡x ${TEST_MODE_CONFIG.maxItems})`);
+        this.addLog("warning", `ðŸ§ª Archivos: ${TEST_MODE_CONFIG.filesPercent}% (mÃ¡x ${TEST_MODE_CONFIG.maxFiles})`);
+        this.addLog("warning", "ðŸ§ª ==========================================");
+      }
+      
+      let totalFiles = 0;
+      let totalItems = 0;
+      let totalApps = 0;
+      let totalWorkspaces = 0;
+      this.scannedFiles = [];
+      this.scannedStats = null;
+      this.scannedApps = [];
+
+      // Reiniciar contadores y estadÃ­sticas
+      this.backupCounts = {
+        organizations: 0,
+        workspaces: 0,
+        applications: 0,
+        items: 0,
+        files: 0,
+        downloadedFiles: 0,
+      };
+
+      this.backupStats = {
+        apps: 0,
+        items: 0,
+        workspaces: 0,
+        files: 0,
+        backupSize: 0,
+        successfulBackups: 0,
+        backupWarnings: 0,
+        downloadedFiles: 0,
+        downloadedBytes: 0,
+      };
+
+      this.lastProgress = 0;
+
+      // Verificar autenticaciÃ³n
+      if (!this.authData) {
+        this.addLog("error", "No autenticado. Llama a authenticate() primero.");
+        throw new Error("No autenticado");
+      }
+
+      // Obtener organizaciones
+      const organizations = await this.getOrganizations();
+      this.backupCounts.organizations = organizations.length;
+
+      // OPTIMIZACIÃ“N: NO contar por adelantado - contar mientras se escanea para evitar llamadas duplicadas
+      this.addLog("info", "ðŸš€ Iniciando escaneo optimizado (sin conteo previo para evitar llamadas duplicadas)...");
+      this.addLog("info", `ðŸ” DEBUG: DespuÃ©s de log 'Iniciando escaneo optimizado' - organizations.length = ${organizations.length}`);
+      
+      // Notificar progreso inicial
+      try {
+        if (progressCallback) {
+          this.addLog("info", `ðŸ” DEBUG: Llamando updateProgress con progreso 1...`);
+          this.updateProgress(1, `Escaneando... (0 apps, 0 items, 0 archivos, 0.00 GB)`, progressCallback);
+          this.addLog("info", `ðŸ” DEBUG: updateProgress completado`);
+        } else {
+          this.addLog("info", `ðŸ” DEBUG: No hay progressCallback disponible`);
+        }
+      } catch (error) {
+        this.addLog("error", `âŒ ERROR en updateProgress: ${error instanceof Error ? error.message : String(error)}`);
+        throw error;
+      }
+
+      // ========================================================================
+      // DOCUMENTACIÃ“N DEL MODO DE ESCANEO
+      // ========================================================================
+      if (scanOnly) {
+          this.addLog("info", "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”");
+          this.addLog("info", "ðŸš€ MODO ESCANEO RÃPIDO ACTIVADO");
+          this.addLog("info", "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”");
+          this.addLog("info", "ðŸ“Š Este modo solo obtiene la estructura organizacional y conteos:");
+          this.addLog("info", "   âœ… Organizaciones â†’ Workspaces â†’ Apps â†’ Conteo de items");
+          this.addLog("info", "   âœ… NO consulta cada item individualmente");
+          this.addLog("info", "   âœ… NO obtiene informaciÃ³n de archivos");
+          this.addLog("info", "   âœ… Guarda estructura completa en base de datos");
+          this.addLog("info", "");
+          this.addLog("info", "ðŸŽ¯ BENEFICIOS:");
+          this.addLog("info", "   âš¡ 95% menos llamadas API durante escaneo");
+          this.addLog("info", "   â±ï¸  Tiempo de escaneo reducido de horas a minutos");
+          this.addLog("info", "   ðŸ“‰ DrÃ¡sticamente menos probabilidad de rate limits");
+          this.addLog("info", "   ðŸ’¾ Estructura guardada para uso posterior en respaldo");
+          this.addLog("info", "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”");
+        } else {
+          this.addLog("info", "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”");
+          this.addLog("info", "ðŸ’¾ MODO RESPALDO COMPLETO ACTIVADO");
+          this.addLog("info", "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”");
+          this.addLog("info", "ðŸ“Š Este modo obtiene informaciÃ³n completa:");
+          this.addLog("info", "   âœ… Todos los items de cada aplicaciÃ³n");
+          this.addLog("info", "   âœ… Todos los archivos de cada item");
+          this.addLog("info", "   âœ… InformaciÃ³n detallada para descarga");
+          this.addLog("info", "");
+          this.addLog("info", "âš ï¸  ADVERTENCIA:");
+          this.addLog("info", "   â±ï¸  Este proceso puede tomar varias horas");
+          this.addLog("info", "   ðŸ“¡ Realiza muchas llamadas a la API");
+          this.addLog("info", "   â¸ï¸  Mayor probabilidad de pausas por rate limit");
+          this.addLog("info", "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”");
+        }
+        
+        // OPTIMIZACIÃ“N: Escanear organizaciones en paralelo
+        // El progreso se calcularÃ¡ basado en organizaciones procesadas (mÃ¡s simple, sin llamadas duplicadas)
+        this.addLog("info", `ðŸš€ INICIANDO PROCESAMIENTO OPTIMIZADO`);
+        this.addLog("info", `ðŸ¢ Organizaciones a procesar: ${organizations.length}`);
+        this.addLog("info", `âš¡ LÃ­mites de Podio API: ${this.PODIO_RATE_LIMITS.general} requests/hora (general), ${this.PODIO_RATE_LIMITS.rateLimited} requests/hora (rate-limited)`);
+        this.addLog("info", `ðŸ“Š Procesamiento: SECUENCIAL (1 a la vez) para evitar rate limit`);
+        this.addLog("info", `âœ… Optimizaciones activas: PaginaciÃ³n + Reintentos + Procesamiento secuencial + Pausas anti-saturaciÃ³n`);
+        
+        // Procesar organizaciones (limitado segÃºn PARALLEL_LIMITS)
+        const allFiles: PodioFile[] = [];
+        const allApps: Array<{ appId: number; folderPath: string; appName: string }> = [];
+        
+        // IMPORTANTE: Rastrear si alguna organizaciÃ³n fallÃ³ debido a rate limit
+        // Esto evita que el progreso llegue a 100% cuando el escaneo no estÃ¡ completo
+        let hasFailedOrganization = false;
+        let failedOrganizationName = '';
+        
+        this.addLog("info", `ðŸ” DEBUG: Antes de iniciar loop de organizaciones - allFiles.length = ${allFiles.length}, allApps.length = ${allApps.length}`);
+        
+        // IMPORTANTE: Procesar SECUENCIALMENTE para evitar que peticiones paralelas sigan ejecutÃ¡ndose
+        // despuÃ©s de un error de rate limit
+        this.addLog("info", `ðŸ”„ Iniciando loop de organizaciones (${organizations.length} organizaciones)...`);
+        this.addLog("info", `ðŸ“Š ESTADO ACTUAL: ${this.backupCounts.workspaces} workspaces, ${this.backupCounts.applications} apps, ${this.backupCounts.items} items, ${this.backupCounts.files} archivos`);
+        
+        // ========================================================================
+        // PASO 4: PROCESAR ORGANIZACIONES (CON MANEJO DE RATE LIMITS Y REINTENTOS)
+        // ========================================================================
+        // Procesar cada organizaciÃ³n secuencialmente. Si hay rate limit,
+        // pausa automÃ¡tica, espera el tiempo necesario y reintenta automÃ¡ticamente.
+        for (let i = 0; i < organizations.length; i++) {
+          // CRÃTICO: Verificar rate limit activo ANTES de continuar
+          if (this.isRateLimitActiveSync()) {
+            this.addLog("error", "â›” Rate limit activo detectado. Deteniendo proceso inmediatamente.");
+            throw new Error('RATE_LIMIT_ERROR:0:general');
+          }
+          
+          // Verificar si el escaneo fue cancelado
+          if (this.isScanCancelled) {
+            this.addLog("warning", "â›” Escaneo cancelado por el usuario. Deteniendo procesamiento...");
+            throw new Error("ESCANEO_CANCELADO: El escaneo fue cancelado por el usuario");
+          }
+          
+          const org = organizations[i];
+          this.addLog("info", `â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”`);
+          this.addLog("info", `ðŸ¢ PASO ${i + 1}/${organizations.length}: Procesando organizaciÃ³n "${org.name}" (ID: ${org.org_id})`);
+          this.addLog("info", `ðŸ“Š ANTES: ${this.backupCounts.workspaces} workspaces, ${this.backupCounts.applications} apps, ${this.backupCounts.items} items, ${this.backupCounts.files} archivos`);
+          
+          // Implementar reintentos automÃ¡ticos para cada organizaciÃ³n
+          let orgAttempts = 0;
+          const MAX_ORG_ATTEMPTS = 3;
+          let orgProcessed = false;
+          
+          while (orgAttempts < MAX_ORG_ATTEMPTS && !orgProcessed) {
+            try {
+              // Procesar la organizaciÃ³n
+              this.addLog("info", `ðŸ“ž Procesando organizaciÃ³n "${org.name}" (intento ${orgAttempts + 1}/${MAX_ORG_ATTEMPTS})...`);
+              const result = await this.processOrganizationParallel(org, progressCallback, organizations.length, i, scanOnly);
+              this.addLog("success", `âœ… OrganizaciÃ³n "${org.name}" procesada exitosamente`);
+              this.addLog("info", `ðŸ“Š RESULTADO: ${result.workspaces.length} workspaces, ${result.applications.length} apps, ${result.items.length} items, ${result.files.length} archivos`);
+              this.addLog("info", `ðŸ“Š DESPUÃ‰S: ${this.backupCounts.workspaces} workspaces, ${this.backupCounts.applications} apps, ${this.backupCounts.items} items, ${this.backupCounts.files} archivos`);
+              
+              // IMPORTANTE: Los contadores ya se actualizan INMEDIATAMENTE durante el procesamiento
+              // No actualizar aquÃ­ para evitar duplicaciÃ³n. Solo actualizar totalWorkspaces para referencia local.
+              totalWorkspaces += result.workspaces.length;
+              
+              // Consolidar archivos
+              allFiles.push(...result.files);
+              
+              // Consolidar aplicaciones para Excel
+              result.applications.forEach(app => {
+                const workspace = result.workspaces.find(w => w.space_id === app.space_id);
+                // Sanitizar nombres para mantener consistencia con createFolderStructure
+                const safeOrgName = this.sanitizeFileName(org.name);
+                const safeWorkspaceName = this.sanitizeFileName(workspace?.name || 'Unknown');
+                const safeAppName = this.sanitizeFileName(app.name);
+                
+                // OPTIMIZACIÃ“N: Usar path con timestamp
+                const basePath = this.backupTimestamp 
+                  ? `${this.backupPath}/${this.backupTimestamp}`
+                  : this.backupPath;
+                const folderPath = `${basePath}/${safeOrgName}/${safeWorkspaceName}/${safeAppName}`;
+                
+                allApps.push({ appId: app.app_id, folderPath, appName: app.name });
+              });
+              
+              orgProcessed = true; // Marcar como procesada exitosamente
+              
+              // PequeÃ±a pausa entre organizaciones para no saturar la API (ya procesamos secuencialmente)
+              if (i + 1 < organizations.length) {
+                await new Promise(resolve => setTimeout(resolve, this.REQUEST_DELAY_MS));
+              }
+              
+            } catch (error) {
+              orgAttempts++;
+              
+              // IMPORTANTE: Si el escaneo fue cancelado, salir inmediatamente
+              if (error instanceof Error && error.message.startsWith("ESCANEO_CANCELADO:")) {
+                this.addLog("warning", "â›” Escaneo cancelado por el usuario");
+                if (progressCallback) {
+                  this.updateProgress(this.lastProgress || 0, "Escaneo cancelado por el usuario", progressCallback);
+                }
+                return; // Salir silenciosamente sin lanzar error
+              }
+              
+              // IMPORTANTE: Si hay un error de rate limit, pausar y reintentar automÃ¡ticamente
+              if (error instanceof Error && error.message.startsWith("RATE_LIMIT_ERROR:")) {
+                const parts = error.message.split(":");
+                const waitTime = Number.parseInt(parts[1], 10) || 60;
+                const limitType = parts[2] || "general";
+                
+                // ========================================================================
+                // OBTENER TIEMPO REAL RESTANTE DESDE BD (TIMESTAMP PRESERVADO)
+                // ========================================================================
+                let realRemainingMinutes = Math.ceil(waitTime / 60) // Por defecto, usar waitTime
+                try {
+                  const rateLimitInfo = await this.getRateLimitInfoFromDb()
+                  if (rateLimitInfo.active && rateLimitInfo.remainingSeconds > 0) {
+                    realRemainingMinutes = Math.ceil(rateLimitInfo.remainingSeconds / 60)
+                    this.addLog("info", `ðŸ“… Tiempo real restante desde BD: ${realRemainingMinutes} minutos`)
+                  }
+                } catch (dbError) {
+                  // Si hay error, usar waitTime como fallback
+                  console.warn('Error obteniendo tiempo real desde BD:', dbError)
+                }
+                
+                this.addLog("warning", `â›” Rate limit detectado al procesar organizaciÃ³n "${org.name}"`);
+                this.addLog("info", `â° Esperando ${realRemainingMinutes} minutos y reintentando automÃ¡ticamente...`);
+                
+                // Crear mensaje base para actualizaciÃ³n dinÃ¡mica
+                const progressMessage = `â° Pausa por rate limit en org ${i + 1}/${organizations.length}. Esperando ${realRemainingMinutes} min... (ReintentarÃ¡ automÃ¡ticamente)`
+                
+                if (progressCallback) {
+                  this.updateProgress(
+                    this.lastProgress || 1, 
+                    progressMessage, 
+                    progressCallback
+                  );
+                }
+                
+                // Esperar el tiempo necesario con progreso visual (pasar callback y mensaje para actualizaciÃ³n dinÃ¡mica)
+                await this.waitForRateLimit(
+                  waitTime, 
+                  limitType as 'general' | 'rateLimited',
+                  progressCallback,
+                  progressMessage
+                );
+                
+                // Verificar si quedan intentos
+                if (orgAttempts < MAX_ORG_ATTEMPTS) {
+                  this.addLog("info", `ðŸ”„ Reintentando procesar organizaciÃ³n "${org.name}"...`);
+                  continue; // Reintentar
+                } else {
+                  this.addLog("error", `âŒ No se pudo procesar la organizaciÃ³n "${org.name}" despuÃ©s de ${MAX_ORG_ATTEMPTS} intentos`);
+                  // IMPORTANTE: Marcar que esta organizaciÃ³n fallÃ³ debido a rate limit
+                  hasFailedOrganization = true;
+                  failedOrganizationName = org.name;
+                  // Continuar con la siguiente organizaciÃ³n en lugar de abortar todo
+                  this.addLog("warning", `âš ï¸ Continuando con la siguiente organizaciÃ³n...`);
+                  break; // Salir del loop de reintentos para esta org
+                }
+              }
+              
+              // Si es otro tipo de error, lanzarlo
+              this.addLog("error", `âŒ Error al procesar organizaciÃ³n "${org.name}": ${error instanceof Error ? error.message : String(error)}`);
+              throw error;
+            }
+          }
+        }
+      
+      // Almacenar resultados consolidados
+      this.scannedFiles = allFiles;
+      this.scannedApps = allApps;
+      
+      // Finalizar escaneo con datos consolidados
+      // IMPORTANTE: Usar scannedFilesComplete.length que incluye todos los archivos encontrados durante el escaneo
+      this.totalFilesToDownload = this.scannedFilesComplete.length;
+      this.addLog("info", `ðŸ“Š Total de archivos a descargar: ${this.totalFilesToDownload} (calculado desde scannedFilesComplete)`);
+      
+      // Asegurar que el tamaÃ±o estÃ© calculado correctamente (sumar todos los archivos)
+      let totalSizeBytes = 0;
+      allFiles.forEach(file => {
+        if (file.size && file.size > 0) {
+          totalSizeBytes += file.size;
+        }
+      });
+      
+      // OPTIMIZACIÃ“N: Sumar tamaÃ±o estimado de los excels al backupSize
+      // Estimar tamaÃ±o de Excel basado en nÃºmero de items (promedio: ~50KB por 1000 items)
+      let estimatedExcelSizeBytes = 0;
+      if (this.backupCounts.items > 0 && allApps.length > 0) {
+        const avgItemsPerApp = this.backupCounts.items / allApps.length;
+        // EstimaciÃ³n: 50KB base + 50KB por cada 1000 items
+        estimatedExcelSizeBytes = allApps.length * (50 * 1024 + Math.max(0, (avgItemsPerApp / 1000) * 50 * 1024));
+      } else {
+        // EstimaciÃ³n conservadora: 100KB por Excel (mÃ­nimo)
+        estimatedExcelSizeBytes = allApps.length * 100 * 1024;
+      }
+      
+      totalSizeBytes += estimatedExcelSizeBytes;
+      
+      // Actualizar backupSize con el tamaÃ±o total en GB
+      this.backupStats.backupSize = totalSizeBytes / (1024 * 1024 * 1024);
+      
+      // Guardar los stats escaneados
+      this.scannedStats = { ...this.backupStats };
+      
+      // IMPORTANTE: Solo actualizar progreso a 95% si NO hay error de rate limit activo
+      let hasRateLimitErrorAt95 = false;
+      if (typeof window !== 'undefined' && window.electron && window.electron.db) {
+        try {
+          const generalStatus = await window.electron.db.getRateLimitStatusFromDb('general');
+          const rateLimitedStatus = await window.electron.db.getRateLimitStatusFromDb('rateLimited');
+          hasRateLimitErrorAt95 = Boolean(
+            (generalStatus.active && generalStatus.resetInSeconds !== null && generalStatus.resetInSeconds > 0) ||
+            (rateLimitedStatus.active && rateLimitedStatus.resetInSeconds !== null && rateLimitedStatus.resetInSeconds > 0)
+          );
+        } catch (error) {
+          // Ignorar errores de verificaciÃ³n
+        }
+      }
+      
+      // Actualizar progreso con estadÃ­sticas finales SOLO si no hay error de rate limit
+      if (progressCallback && !hasRateLimitErrorAt95) {
+        this.updateProgress(95, `Escaneo casi completado: ${this.backupCounts.applications} apps, ${this.backupCounts.items} items, ${this.backupCounts.files} archivos`, progressCallback);
+      } else if (progressCallback && hasRateLimitErrorAt95) {
+        // Si hay error de rate limit, mantener el progreso en 1%
+        this.updateProgress(1, `â›” Escaneo pausado por lÃ­mite de tasa`, progressCallback);
+      }
+      
+      // Finalizar escaneo
+      const totalBytes = totalSizeBytes;
+      this.addLog("success", `âœ… Escaneo de respaldo completado`);
+      this.addLog("info", `ðŸ“Š Organizaciones: ${this.backupCounts.organizations}`);
+      this.addLog("info", `ðŸ“Š Espacios de trabajo: ${this.backupCounts.workspaces}`);
+      this.addLog("info", `ðŸ“Š Aplicaciones: ${this.backupCounts.applications}`);
+      this.addLog("info", `ðŸ“Š Elementos: ${this.backupCounts.items}`);
+      this.addLog("info", `ðŸ“Š Archivos encontrados: ${this.backupCounts.files}`);
+      this.addLog("info", `ðŸ“Š TamaÃ±o estimado: ${this.backupStats.backupSize.toFixed(2)} GB (${totalBytes.toLocaleString()} bytes)`);
+      
+      // Guardar escaneo en BD con el tamaÃ±o estimado
+      if (typeof window !== 'undefined' && window.electron && window.electron.db && this.currentScanId) {
+        try {
+          await window.electron.db.finalizeScan(this.currentScanId, {
+            organizations: this.backupCounts.organizations,
+            workspaces: this.backupCounts.workspaces,
+            applications: this.backupCounts.applications,
+            items: this.backupCounts.items,
+            files: this.backupCounts.files,
+            backupSize: this.backupStats.backupSize
+          });
+          this.addLog("success", `âœ… Escaneo guardado en BD: ${this.backupCounts.applications} apps, ${this.backupCounts.items} items, ${this.backupCounts.files} archivos, ${this.backupStats.backupSize.toFixed(2)} GB`);
+        } catch (dbError) {
+          console.warn('Error guardando escaneo en BD:', dbError);
+        }
+      }
+      
+      // IMPORTANTE: Solo actualizar el item en Podio si NO hay error de rate limit
+      // Verificar si hay un error de rate limit activo antes de actualizar
+      let hasRateLimitError = false;
+      if (typeof window !== 'undefined' && window.electron && window.electron.db) {
+        try {
+          const generalStatus = await window.electron.db.getRateLimitStatusFromDb('general');
+          const rateLimitedStatus = await window.electron.db.getRateLimitStatusFromDb('rateLimited');
+          hasRateLimitError = Boolean(
+            (generalStatus.active && generalStatus.resetInSeconds !== null && generalStatus.resetInSeconds > 0) ||
+            (rateLimitedStatus.active && rateLimitedStatus.resetInSeconds !== null && rateLimitedStatus.resetInSeconds > 0)
+          );
+        } catch (error) {
+          // Ignorar errores de verificaciÃ³n
+        }
+      }
+      
+      // CRÃTICO: Si alguna organizaciÃ³n fallÃ³ debido a rate limit, NO actualizar a 100%
+      // incluso si el rate limit ya pasÃ³. El escaneo no estÃ¡ completo.
+      if (hasFailedOrganization) {
+        this.addLog("error", `â›” ESCANEO INCOMPLETO: La organizaciÃ³n "${failedOrganizationName}" no se pudo procesar debido a rate limit`);
+        this.addLog("warning", `â›” NO se actualizarÃ¡ el item en Podio - El escaneo no estÃ¡ completo`);
+        // Mantener el progreso en el Ãºltimo valor vÃ¡lido (no 100%)
+        if (progressCallback) {
+          const lastValidProgress = this.lastProgress || 1;
+          this.updateProgress(
+            lastValidProgress, 
+            `â¸ï¸ Escaneo pausado: La organizaciÃ³n "${failedOrganizationName}" no se pudo procesar. Presiona "Reanudar Escaneo" para continuar.`, 
+            progressCallback
+          );
+        }
+        // Lanzar error para que el dashboard sepa que el escaneo no completÃ³
+        throw new Error(`RATE_LIMIT_ERROR:0:general: Escaneo incompleto - La organizaciÃ³n "${failedOrganizationName}" no se pudo procesar despuÃ©s de 3 intentos`);
+      }
+      
+      // Solo actualizar el item si NO hay error de rate limit
+      if (!hasRateLimitError) {
+        // Actualizar el tamaÃ±o estimado en Podio
+        await this.updateEstimatedSizeInBackupRecord();
+        
+        // ACTUALIZAR EL ITEM DE BACKUP EN PODIO CON LOS DATOS DEL ESCANEO
+        await this.updateBackupRecord(false);
+        
+        // Actualizar progreso final con todas las estadÃ­sticas
+        if (progressCallback) {
+          this.updateProgress(100, `âœ… Escaneo completado: ${this.backupCounts.applications} apps, ${this.backupCounts.items} items, ${this.backupCounts.files} archivos, ${this.backupStats.backupSize.toFixed(2)} GB`, progressCallback);
+        }
+      } else {
+        this.addLog("warning", `â›” Error de rate limit activo - NO se actualizarÃ¡ el item en Podio para evitar llegar a 99%`);
+        // Mantener el progreso en 1% si hay error de rate limit
+        if (progressCallback) {
+          this.updateProgress(1, `â›” Escaneo pausado por lÃ­mite de tasa`, progressCallback);
+        }
+      }
+    } catch (error) {
+      // IMPORTANTE: Si es un error de rate limit, NO actualizar el item en Podio
+      if (error instanceof Error && error.message.startsWith("RATE_LIMIT_ERROR:")) {
+        this.addLog("error", `â›” ERROR DE RATE LIMIT - NO SE ACTUALIZARÃ EL ITEM EN PODIO`);
+        this.addLog("error", `Error durante el escaneo: ${error.message}`);
+        // Mantener el progreso en 1%
+        if (progressCallback) {
+          const parts = error.message.split(":");
+          const waitTime = Number.parseInt(parts[1], 10) || 60;
+          this.updateProgress(1, `â›” Escaneo pausado por lÃ­mite de tasa. Esperando ${Math.ceil(waitTime / 60)} minutos...`, progressCallback);
+        }
+        throw error;
+      }
+      
+      this.addLog("error", `Error durante el escaneo: ${error instanceof Error ? error.message : String(error)}`);
+      throw error;
+    } finally {
+      // Desactivar modo escaneo al finalizar (permite usar cachÃ© en otras operaciones)
+      this.isScanning = false;
+    }
+  }

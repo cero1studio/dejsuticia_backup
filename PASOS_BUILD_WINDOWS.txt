@@ -1,0 +1,39 @@
+═══════════════════════════════════════════════════════════════
+  PASOS SIMPLES PARA COMPILAR EN WINDOWS
+═══════════════════════════════════════════════════════════════
+
+1. COPIAR TODO EL PROYECTO A WINDOWS
+   - Copia toda la carpeta "podio-backup2" completa
+   - Incluye: node_modules, .next, todo (o mejor, copia sin node_modules)
+
+2. ABRIR TERMINAL EN WINDOWS
+   - PowerShell o CMD
+   - Ir a la carpeta del proyecto:
+     cd C:\ruta\a\podio-backup2
+
+3. INSTALAR DEPENDENCIAS (si no copiaste node_modules)
+   npm install
+   (Esto puede tardar 5-10 minutos)
+
+4. COMPILAR EL EJECUTABLE
+   npm run build:win:portable
+   (Esto puede tardar 10-30 minutos la primera vez)
+
+5. EL EJECUTABLE ESTARÁ EN:
+   dist\Podio Backup-0.1.0-x64.exe
+
+═══════════════════════════════════════════════════════════════
+  NOTAS IMPORTANTES
+═══════════════════════════════════════════════════════════════
+
+✅ NO necesitas cambiar nada en el código
+✅ Los cambios ya están guardados (servidor Next.js)
+✅ Funcionará directamente
+✅ El .exe será portable (no requiere instalación)
+
+⚠️  Si aparece error sobre Python o build-tools:
+    - Instala Visual Studio Build Tools
+    - O ejecuta: npm install --global windows-build-tools
+
+═══════════════════════════════════════════════════════════════
+

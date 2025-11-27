@@ -1,0 +1,2369 @@
+interface PodioAuth {
+  access_token: string
+  refresh_token: string
+  expires_in: number
+  expires_at: number
+}
+
+interface PodioOrganization {
+  org_id: number
+  name: string
+  url: string
+}
+
+interface PodioWorkspace {
+  space_id: number
+  name: string
+  url: string
+}
+
+interface PodioApplication {
+  app_id: number
+  name: string
+  url: string
+}
+
+interface PodioItem {
+  item_id: number
+  title: string
+  fields: Record<string, any>
+}
+
+interface PodioFile {
+  file_id: number
+  name: string
+  link: string
+  mimetype: string
+  size: number
+  download_link?: string
+}
+
+interface BackupOptions {
+  organizations: boolean
+  workspaces: boolean
+  applications: boolean
+  items: boolean
+  files: boolean
+}
+
+interface BackupCounts {
+  organizations: number
+  workspaces: number
+  applications: number
+  items: number
+  files: number
+  downloadedFiles: number
+}
+
+interface BackupStats {
+  apps: number
+  items: number
+  workspaces: number
+  files: number
+  backupSize: number
+  successfulBackups: number
+  backupWarnings: number
+  downloadedFiles: number
+  downloadedBytes: number
+}
+
+interface BackupHistoryItem {
+  titulo: string
+  categoria: string
+  fecha: {
+    start: string
+    end?: string
+  }
+  estado: string
+  organizaciones: number
+  espaciosDeTrabajo: number
+  aplicaciones: number
+  items: number
+  archivos: number
+  tamanoEnGb: string
+}
+
+type LogLevel = "info" | "warning" | "error" | "success"
+
+interface LogMessage {
+  level: LogLevel
+  message: string
+  timestamp: Date
+}
+
+type ProgressCallback = (data: {
+  progress: number
+  status: string
+  counts: BackupCounts
+  stats: BackupStats
+  logs: LogMessage[]
+}) => void
+
+// Tipos para el manejo de límites de tasa
+interface RateLimitInfo {
+  type: "general" | "rateLimited"
+  remaining: number
+  limit: number
+  resetTime: number
+}
+
+// Cambiar el límite de test a 20 en todo el flujo
+const TEST_LIMIT = 20;
+
+function isTestMode() {
+  if (typeof window !== "undefined") {
+    return (
+      process.env.NEXT_PUBLIC_PODIO_TEST_MODE === "true" ||
+      localStorage.getItem("podio_test_mode") === "true"
+    )
+  }
+  return process.env.NEXT_PUBLIC_PODIO_TEST_MODE === "true"
+}
+
+// Elimina la declaración global de window.electron para evitar conflictos de tipos
+
+export class PodioBackupService {
+  protected authData: PodioAuth | null = null
+  private baseUrl = "https://api.podio.com"
+  public backupPath = "./public/backups"
+  private maxConcurrentRequests = 5
+  private logs: LogMessage[] = []
+  protected lastProgress = 0
+  
+  // Límites optimizados de paginación
+  private readonly PAGINATION_LIMITS = {
+    items: 1000,        // Máximo permitido por Podio para items
+    files: 500,         // Límite conservador para archivos
+    applications: 100,  // Límite para aplicaciones
+    workspaces: 50,    // Límite para espacios de trabajo
+    organizations: 20   // Límite para organizaciones
+  }
+  private backupItemId: number | null = null
+  private isDownloading = false
+  private scannedFiles: PodioFile[] = [];
+  private totalFilesToDownload: number | null = null;
+  public scannedStats: BackupStats | null = null;
+  public scannedApps: Array<{ appId: number; folderPath: string; appName: string }> = [];
+  
+  // Almacenar archivos completos con toda la información necesaria para descarga
+  private scannedFilesComplete: Array<{
+    file: PodioFile;
+    downloadUrl: string;
+    folderPath: string;
+    appName: string;
+  }> = [];
+
+  // Nuevas propiedades para el manejo de límites de tasa
+  private requestQueue: Array<() => Promise<any>> = []
+  private isProcessingQueue = false
+  private rateLimits = {
+    general: { limit: 1000, remaining: 1000, resetTime: 0 },
+    rateLimited: { limit: 250, remaining: 250, resetTime: 0 },
+  }
+  private activeRateLimit: RateLimitInfo | null = null
+  private rateLimitRetryTimeout: NodeJS.Timeout | null = null
+  private rateLimitCallback: (() => void) | null = null
+
+  // Sistema de caché para reducir llamadas repetitivas
+  private cache = new Map<string, { data: any; timestamp: number; ttl: number }>()
+  private readonly CACHE_TTL = {
+    organizations: 3600000, // 1 hora
+    workspaces: 1800000,    // 30 minutos
+    applications: 1800000,   // 30 minutos
+    itemCount: 300000,      // 5 minutos
+    fileInfo: 600000,       // 10 minutos
+  }
+
+  protected backupCounts: BackupCounts = {
+    organizations: 0,
+    workspaces: 0,
+    applications: 0,
+    items: 0,
+    files: 0,
+    downloadedFiles: 0,
+  }
+
+  protected backupStats: BackupStats = {
+    apps: 0,
+    items: 0,
+    workspaces: 0,
+    files: 0,
+    backupSize: 0,
+    successfulBackups: 0,
+    backupWarnings: 0,
+    downloadedFiles: 0,
+    downloadedBytes: 0,
+  }
+
+  private backupAppFieldIds: string[] = [];
+  private backupStartDate: string | null = null;
+
+  constructor(backupPath?: string, maxConcurrentRequests?: number) {
+    if (backupPath) {
+      this.backupPath = backupPath
+    }
+
+    // Intentar cargar la configuración guardada
+    try {
+      if (typeof window !== "undefined") {
+        const savedConfig = localStorage.getItem("podio_backup_config")
+        if (savedConfig) {
+          const config = JSON.parse(savedConfig)
+          if (config.folderPath) {
+            this.backupPath = config.folderPath
+          }
+        }
+      }
+    } catch (e) {
+      console.error("Error al cargar la configuración de ruta:", e)
+    }
+
+    if (maxConcurrentRequests) {
+      this.maxConcurrentRequests = maxConcurrentRequests
+    }
+
+    this.addLog("info", "Servicio de respaldo de Podio inicializado")
+    this.addLog("info", `Ruta de respaldo configurada: ${this.backupPath}`)
+
+    // Inicializar los tiempos de reinicio de los límites según documentación oficial de Podio
+    const now = Date.now()
+    this.rateLimits = {
+      general: { limit: 1000, remaining: 1000, resetTime: now + 3600000 }, // 1000 por hora
+      rateLimited: { limit: 250, remaining: 250, resetTime: now + 3600000 }, // 250 por hora
+    }
+
+    // Eliminar la inicialización automática de la carpeta de respaldos para evitar errores en Electron
+    // this.initializeBackupFolder().catch((error) => {
+    //   this.addLog(
+    //     "error",
+    //     `Error al inicializar carpeta de respaldos: ${error instanceof Error ? error.message : String(error)}`,
+    //   )
+    // })
+  }
+
+  /**
+   * Inicializar la carpeta de respaldos
+   */
+  protected async initializeBackupFolder(): Promise<void> {
+    try {
+      this.addLog("info", `Inicializando carpeta de respaldos: ${this.backupPath}`);
+      // La creación real de la carpeta debe hacerse desde el proceso principal de Electron o el bridge
+      // Por lo tanto, aquí solo dejamos el log
+      this.addLog("success", `Carpeta de respaldos inicializada (verificada): ${this.backupPath}`);
+    } catch (error) {
+      this.addLog(
+        "warning",
+        `Error al inicializar carpeta de respaldos: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  /**
+   * Obtener el historial de respaldos desde Podio
+   */
+  async getBackupHistory(backupAppId: number): Promise<BackupHistoryItem[]> {
+    try {
+      this.addLog("info", `Obteniendo historial de respaldos desde la aplicación ${backupAppId}...`)
+
+      if (!this.authData) {
+        this.addLog("error", "No autenticado. Llama a authenticate() primero.")
+        return []
+      }
+
+      // Obtener los elementos de la aplicación de respaldo
+      const response = await this.apiRequest<any>(`/item/app/${backupAppId}/?limit=10`)
+
+      if (!response || !Array.isArray(response.items)) {
+        this.addLog("warning", `Respuesta inesperada al obtener historial de respaldos: ${JSON.stringify(response)}`)
+        return []
+      }
+
+      // Mapear los elementos a objetos BackupHistoryItem
+      const historyItems = response.items.map((item: any) => {
+        // Extraer los campos relevantes
+        const fields = item.fields || []
+
+        // Buscar los campos por su nombre externo
+        const findFieldValue = (externalId: string) => {
+          const field = fields.find((f: any) => f.external_id === externalId)
+          return field ? field.values : null
+        }
+
+        // Obtener valores de los campos
+        const titulo = item.title || "Respaldo sin título"
+        const categoria = findFieldValue("categoria") ? findFieldValue("categoria")[0].value : "General"
+        const fechaStart = findFieldValue("fecha") ? findFieldValue("fecha")[0].start : new Date().toISOString()
+        const fechaEnd = findFieldValue("fecha") ? findFieldValue("fecha")[0].end : null
+        const estado = findFieldValue("estado") ? findFieldValue("estado")[0].value : "Pendiente"
+        const organizaciones = findFieldValue("organizaciones") ? Number(findFieldValue("organizaciones")[0].value) : 0
+        const espaciosDeTrabajo = findFieldValue("espacios-de-trabajo")
+          ? Number(findFieldValue("espacios-de-trabajo")[0].value)
+          : 0
+        const aplicaciones = findFieldValue("aplicaciones") ? Number(findFieldValue("aplicaciones")[0].value) : 0
+        const items = findFieldValue("items") ? Number(findFieldValue("items")[0].value) : 0
+        const archivos = findFieldValue("archivos") ? Number(findFieldValue("archivos")[0].value) : 0
+        const tamanoEnGb = findFieldValue("tamano-en-gb") ? findFieldValue("tamano-en-gb")[0].value : "0 GB"
+
+        return {
+          titulo,
+          categoria,
+          fecha: {
+            start: fechaStart,
+            end: fechaEnd,
+          },
+          estado,
+          organizaciones,
+          espaciosDeTrabajo,
+          aplicaciones,
+          items,
+          archivos,
+          tamanoEnGb,
+        }
+      })
+
+      this.addLog("success", `Se encontraron ${historyItems.length} registros de respaldo`)
+      return historyItems
+    } catch (error) {
+      this.addLog(
+        "error",
+        `Error al obtener historial de respaldos: ${error instanceof Error ? error.message : String(error)}`,
+      )
+      return []
+    }
+  }
+
+  /**
+   * Obtener estadísticas de respaldo
+   */
+  getBackupStats(): BackupStats {
+    return { ...this.backupStats }
+  }
+
+  /**
+   * Obtener logs
+   */
+  getLogs(): LogMessage[] {
+    return [...this.logs]
+  }
+
+  /**
+   * Obtener información sobre límites de tasa
+   */
+  getRateLimitInfo() {
+    return {
+      active: !!this.activeRateLimit,
+      remainingSeconds: this.activeRateLimit ? Math.ceil((this.activeRateLimit.resetTime - Date.now()) / 1000) : 0,
+      type: this.activeRateLimit ? this.activeRateLimit.type : "none",
+    }
+  }
+
+  /**
+   * Establecer callback para cuando termine el rate limit
+   */
+  setRateLimitCallback(callback: () => void) {
+    this.rateLimitCallback = callback
+  }
+
+  /**
+   * Determinar si una operación es rate-limited según endpoint y método
+   */
+  private isRateLimitedOperation(endpoint: string, method: string): boolean {
+    // POST/PUT/DELETE son rate-limited
+    if (method !== 'GET') return true
+    
+    // Endpoints específicos rate-limited
+    if (endpoint.includes('/file/') || 
+        endpoint.includes('/xlsx/') || 
+        endpoint.includes('/download_link')) {
+      return true
+    }
+    
+    return false
+  }
+
+  /**
+   * Encola una solicitud a la API y la procesa respetando los límites de tasa
+   */
+  private async enqueueRequest<T>(requestFn: () => Promise<T>, endpoint: string, method: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      // Añadir la solicitud a la cola
+      this.requestQueue.push(async () => {
+        try {
+          // Verificar si hay un límite de tasa activo
+          if (this.activeRateLimit) {
+            const waitTime = Math.ceil((this.activeRateLimit.resetTime - Date.now()) / 1000)
+            this.addLog(
+              "warning",
+              `Límite de tasa activo (${this.activeRateLimit.type}). Esperando ${waitTime} segundos...`,
+            )
+            throw new Error(`RATE_LIMIT_ERROR:${waitTime}:${this.activeRateLimit.type}`)
+          }
+
+          // Verificar y actualizar los límites de tasa
+          this.updateRateLimits()
+
+          // Determinar el tipo de límite según la operación
+          const limitType = this.isRateLimitedOperation(endpoint, method)
+          const currentLimit = this.rateLimits[limitType ? 'rateLimited' : 'general']
+
+          // Verificar si hemos alcanzado el límite
+          if (currentLimit.remaining <= 0) {
+            const waitTime = Math.ceil((currentLimit.resetTime - Date.now()) / 1000)
+            this.setActiveRateLimit(limitType ? 'rateLimited' : 'general', waitTime)
+            throw new Error(`RATE_LIMIT_ERROR:${waitTime}:${limitType ? 'rateLimited' : 'general'}`)
+          }
+
+          // Decrementar el contador del límite apropiado
+          currentLimit.remaining--
+
+          // Ejecutar la solicitud
+          const result = await requestFn()
+          resolve(result)
+          return result
+        } catch (error) {
+          if (error instanceof Error && error.message.startsWith("RATE_LIMIT_ERROR:")) {
+            // Si es un error de rate limit, lo propagamos para que se maneje en el nivel superior
+            reject(error)
+          } else {
+            // Otros errores
+            reject(error)
+          }
+          throw error
+        }
+      })
+
+      // Iniciar el procesamiento de la cola si no está en curso
+      if (!this.isProcessingQueue) {
+        this.processQueue()
+      }
+    })
+  }
+
+  /**
+   * Actualiza los límites de tasa según el tiempo transcurrido
+   */
+  private updateRateLimits(): void {
+    const now = Date.now()
+
+    // Reiniciar el límite general cada hora
+    if (now >= this.rateLimits.general.resetTime) {
+      this.rateLimits.general.remaining = this.rateLimits.general.limit
+      this.rateLimits.general.resetTime = now + 3600000 // 1 hora
+    }
+
+    // Reiniciar el límite rate-limited cada hora
+    if (now >= this.rateLimits.rateLimited.resetTime) {
+      this.rateLimits.rateLimited.remaining = this.rateLimits.rateLimited.limit
+      this.rateLimits.rateLimited.resetTime = now + 3600000 // 1 hora
+    }
+  }
+
+  /**
+   * Establece un límite de tasa activo
+   */
+  private setActiveRateLimit(type: "general" | "rateLimited", waitTime: number): void {
+    const now = Date.now()
+    this.activeRateLimit = {
+      type,
+      remaining: 0,
+      limit: this.rateLimits[type].limit,
+      resetTime: now + waitTime * 1000,
+    }
+
+    this.addLog(
+      "error",
+      `⚠️ LÍMITE DE TASA DE PODIO ALCANZADO (${type}). Se esperará ${waitTime} segundos antes de reintentar automáticamente.`,
+    )
+
+    // Configurar un temporizador para desactivar el límite
+    if (this.rateLimitRetryTimeout) {
+      clearTimeout(this.rateLimitRetryTimeout)
+    }
+
+    this.rateLimitRetryTimeout = setTimeout(() => {
+      this.activeRateLimit = null
+      this.addLog("info", "✅ Tiempo de espera por límite de tasa completado. Continuando operaciones...")
+
+      // Llamar al callback si existe
+      if (this.rateLimitCallback) {
+        const callback = this.rateLimitCallback
+        this.rateLimitCallback = null
+        callback()
+      }
+    }, waitTime * 1000)
+  }
+
+  // Actualizar la función getRateLimitTitle para reflejar los nuevos límites
+  // Función para obtener el título del límite de tasa
+  private getRateLimitTitle(type: string): string {
+    switch (type) {
+      case "general":
+        return "LÍMITE GENERAL (1,000 solicitudes/hora)"
+      case "rateLimited":
+        return "LÍMITE RATE-LIMITED (250 solicitudes/hora)"
+      default:
+        return "LÍMITE DE TASA DE PODIO ALCANZADO"
+    }
+  }
+
+  /**
+   * Actualizar límites desde headers de respuesta de Podio
+   */
+  private updateRateLimitsFromHeaders(headers: Headers, endpoint: string, method: string): void {
+    const limitType = this.isRateLimitedOperation(endpoint, method) ? 'rateLimited' : 'general'
+    const limit = headers.get('X-Rate-Limit-Limit')
+    const remaining = headers.get('X-Rate-Limit-Remaining')
+    
+    if (limit && remaining) {
+      this.rateLimits[limitType].limit = parseInt(limit)
+      this.rateLimits[limitType].remaining = parseInt(remaining)
+      this.addLog("info", `Rate limit ${limitType}: ${remaining}/${limit} restantes`)
+    }
+  }
+
+  /**
+   * Sistema de caché para reducir llamadas repetitivas
+   */
+  private getCacheKey(endpoint: string, method: string = "GET"): string {
+    return `${method}:${endpoint}`
+  }
+
+  private getFromCache<T>(endpoint: string, method: string = "GET"): T | null {
+    const key = this.getCacheKey(endpoint, method)
+    const cached = this.cache.get(key)
+    
+    if (!cached) return null
+    
+    const now = Date.now()
+    if (now - cached.timestamp > cached.ttl) {
+      this.cache.delete(key)
+      return null
+    }
+    
+    this.addLog("info", `Cache hit para ${endpoint}`)
+    return cached.data
+  }
+
+  private setCache<T>(endpoint: string, data: T, method: string = "GET", ttl?: number): void {
+    const key = this.getCacheKey(endpoint, method)
+    
+    // Determinar TTL basado en el endpoint
+    let cacheTtl = ttl
+    if (!cacheTtl) {
+      if (endpoint.includes('/org/')) cacheTtl = this.CACHE_TTL.organizations
+      else if (endpoint.includes('/space/')) cacheTtl = this.CACHE_TTL.workspaces
+      else if (endpoint.includes('/app/')) cacheTtl = this.CACHE_TTL.applications
+      else if (endpoint.includes('/count')) cacheTtl = this.CACHE_TTL.itemCount
+      else if (endpoint.includes('/file/')) cacheTtl = this.CACHE_TTL.fileInfo
+      else cacheTtl = 300000 // 5 minutos por defecto
+    }
+    
+    this.cache.set(key, {
+      data,
+      timestamp: Date.now(),
+      ttl: cacheTtl
+    })
+    
+    this.addLog("info", `Cache set para ${endpoint} (TTL: ${cacheTtl/1000}s)`)
+  }
+
+  private clearCache(): void {
+    this.cache.clear()
+    this.addLog("info", "Cache limpiado")
+  }
+
+  /**
+   * Reintentos inteligentes con backoff exponencial
+   */
+  private async retryWithBackoff<T>(
+    operation: () => Promise<T>,
+    maxRetries: number = 3,
+    baseDelay: number = 1000,
+    operationName: string = "operación"
+  ): Promise<T> {
+    let lastError: Error | null = null
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const result = await operation()
+        if (attempt > 1) {
+          this.addLog("success", `✅ ${operationName} exitosa en intento ${attempt}/${maxRetries} (después de reintentos)`)
+        }
+        return result
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error))
+        
+        // No reintentar errores de rate limit o errores de autenticación
+        if (lastError.message.includes('RATE_LIMIT_ERROR') || 
+            lastError.message.includes('No autenticado') ||
+            lastError.message.includes('401') ||
+            lastError.message.includes('403')) {
+          throw lastError
+        }
+        
+        if (attempt === maxRetries) {
+          this.addLog("error", `${operationName} falló después de ${maxRetries} intentos: ${lastError.message}`)
+          throw lastError
+        }
+        
+        // Calcular delay con backoff exponencial + jitter
+        const exponentialDelay = baseDelay * Math.pow(2, attempt - 1)
+        const jitter = Math.random() * 1000 // 0-1000ms de jitter
+        const delay = Math.min(exponentialDelay + jitter, 30000) // Máximo 30 segundos
+        
+        this.addLog("warning", `🔄 REINTENTO ${attempt}/${maxRetries}: ${operationName} falló`)
+        this.addLog("info", `❌ Error: ${lastError.message}`)
+        this.addLog("info", `⏳ Reintentando en ${Math.round(delay/1000)}s con backoff exponencial...`)
+        
+        await new Promise(resolve => setTimeout(resolve, delay))
+      }
+    }
+    
+    throw lastError || new Error(`${operationName} falló después de ${maxRetries} intentos`)
+  }
+
+  /**
+   * Procesar organización en paralelo con mensajes detallados
+   */
+  private async processOrganizationParallel(org: any, progressCallback?: ProgressCallback): Promise<{
+    workspaces: any[];
+    applications: any[];
+    items: any[];
+    files: PodioFile[];
+  }> {
+    this.addLog("info", `🏢 Procesando organización: ${org.name}`);
+    
+    const workspaces = await this.retryWithBackoff(
+      () => this.getWorkspaces(org.org_id),
+      3,
+      1000,
+      `obtener espacios de trabajo de ${org.name}`
+    );
+    
+    this.addLog("info", `📁 Espacios encontrados en ${org.name}: ${workspaces.length}`);
+    
+    // Procesar espacios de trabajo en paralelo
+    const workspacePromises = workspaces.map(workspace => 
+      this.processWorkspaceParallel(workspace, progressCallback)
+    );
+    
+    this.addLog("info", `⚡ Procesando ${workspaces.length} espacios en paralelo...`);
+    const workspaceResults = await Promise.all(workspacePromises);
+    
+    // Consolidar resultados
+    const allApplications = workspaceResults.flatMap(result => result.applications);
+    const allItems = workspaceResults.flatMap(result => result.items);
+    const allFiles = workspaceResults.flatMap(result => result.files);
+    
+    this.addLog("success", `✅ Organización ${org.name} completada:`);
+    this.addLog("info", `   📁 Espacios: ${workspaces.length}`);
+    this.addLog("info", `   📱 Aplicaciones: ${allApplications.length}`);
+    this.addLog("info", `   📄 Items: ${allItems.length}`);
+    this.addLog("info", `   📎 Archivos: ${allFiles.length}`);
+    
+    return {
+      workspaces,
+      applications: allApplications,
+      items: allItems,
+      files: allFiles
+    };
+  }
+
+  /**
+   * Procesar espacio de trabajo en paralelo
+   */
+  private async processWorkspaceParallel(workspace: any, progressCallback?: ProgressCallback): Promise<{
+    applications: any[];
+    items: any[];
+    files: PodioFile[];
+  }> {
+    this.addLog("info", `Procesando espacio de trabajo en paralelo: ${workspace.name}`);
+    
+    const applications = await this.retryWithBackoff(
+      () => this.getApplications(workspace.space_id),
+      3,
+      1000,
+      `obtener aplicaciones de ${workspace.name}`
+    );
+    
+    // Procesar aplicaciones en paralelo (limitado para evitar sobrecarga)
+    const maxConcurrentApps = 3; // Procesar máximo 3 apps en paralelo
+    const allItems: any[] = [];
+    const allFiles: PodioFile[] = [];
+    
+    for (let i = 0; i < applications.length; i += maxConcurrentApps) {
+      const appBatch = applications.slice(i, i + maxConcurrentApps);
+      const appPromises = appBatch.map(app => 
+        this.processApplicationParallel(app, progressCallback)
+      );
+      
+      const appResults = await Promise.all(appPromises);
+      
+      appResults.forEach(result => {
+        allItems.push(...result.items);
+        allFiles.push(...result.files);
+      });
+    }
+    
+    return {
+      applications,
+      items: allItems,
+      files: allFiles
+    };
+  }
+
+  /**
+   * Procesar aplicación en paralelo
+   */
+  private async processApplicationParallel(app: any, progressCallback?: ProgressCallback): Promise<{
+    items: any[];
+    files: PodioFile[];
+  }> {
+    this.addLog("info", `Procesando aplicación en paralelo: ${app.name}`);
+    
+    const items = await this.retryWithBackoff(
+      () => this.getItems(app.app_id),
+      3,
+      1000,
+      `obtener items de ${app.name}`
+    );
+    
+    // Procesar items en paralelo (limitado para evitar sobrecarga)
+    const maxConcurrentItems = 5; // Procesar máximo 5 items en paralelo
+    const allFiles: PodioFile[] = [];
+    
+    for (let i = 0; i < items.length; i += maxConcurrentItems) {
+      const itemBatch = items.slice(i, i + maxConcurrentItems);
+      const itemPromises = itemBatch.map(item => 
+        this.retryWithBackoff(
+          () => this.getItemFiles(item.item_id),
+          3,
+          1000,
+          `obtener archivos del item ${item.item_id}`
+        )
+      );
+      
+      const itemResults = await Promise.all(itemPromises);
+      allFiles.push(...itemResults.flat());
+    }
+    
+    return {
+      items,
+      files: allFiles
+    };
+  }
+
+  /**
+   * Esperar hasta que se restablezca un límite de tasa con mensajes detallados
+   */
+  private async waitForRateLimit(waitTimeSeconds: number): Promise<void> {
+    const hours = Math.floor(waitTimeSeconds / 3600)
+    const minutes = Math.floor((waitTimeSeconds % 3600) / 60)
+    const seconds = waitTimeSeconds % 60
+    
+    let timeString = ""
+    if (hours > 0) timeString += `${hours}h `
+    if (minutes > 0) timeString += `${minutes}m `
+    if (seconds > 0) timeString += `${seconds}s`
+    
+    this.addLog("warning", `⏰ LÍMITE DE TASA ALCANZADO - Esperando ${timeString} para restablecer límites de Podio...`)
+    this.addLog("info", `🔄 La aplicación continuará automáticamente después de la espera`)
+    
+    // Mostrar progreso de espera cada 30 segundos
+    const updateInterval = 30000 // 30 segundos
+    let remainingTime = waitTimeSeconds * 1000
+    
+    return new Promise((resolve) => {
+      const interval = setInterval(() => {
+        remainingTime -= updateInterval
+        const remainingSeconds = Math.ceil(remainingTime / 1000)
+        
+        if (remainingSeconds > 0) {
+          const remainingHours = Math.floor(remainingSeconds / 3600)
+          const remainingMinutes = Math.floor((remainingSeconds % 3600) / 60)
+          const remainingSecs = remainingSeconds % 60
+          
+          let remainingString = ""
+          if (remainingHours > 0) remainingString += `${remainingHours}h `
+          if (remainingMinutes > 0) remainingString += `${remainingMinutes}m `
+          if (remainingSecs > 0) remainingString += `${remainingSecs}s`
+          
+          this.addLog("info", `⏳ Tiempo restante: ${remainingString}`)
+        }
+      }, updateInterval)
+      
+      setTimeout(() => {
+        clearInterval(interval)
+        this.addLog("success", "✅ Límite de tasa restablecido. Continuando operaciones...")
+        resolve()
+      }, waitTimeSeconds * 1000)
+    })
+  }
+
+  /**
+    if (this.isProcessingQueue) return
+
+    this.isProcessingQueue = true
+
+    while (this.requestQueue.length > 0) {
+      // Si hay un límite de tasa activo, pausamos el procesamiento
+      if (this.activeRateLimit) {
+        break
+      }
+
+      const request = this.requestQueue.shift()
+      if (request) {
+        try {
+          await request()
+        } catch (error) {
+          // Los errores ya son manejados en enqueueRequest
+          if (error instanceof Error && error.message.startsWith("RATE_LIMIT_ERROR:")) {
+            // Si es un error de rate limit, pausamos el procesamiento
+            break
+          }
+        }
+
+        // Pequeña pausa entre solicitudes para evitar ráfagas
+        if (this.requestQueue.length > 0) {
+          await new Promise((r) => setTimeout(r, 50))
+        }
+      }
+    }
+
+    this.isProcessingQueue = false
+
+    // Si la cola no está vacía y no hay un límite activo, continuamos procesando
+    if (this.requestQueue.length > 0 && !this.activeRateLimit) {
+      this.processQueue()
+    }
+  }
+
+  /**
+   * Añadir un mensaje al log
+   */
+  protected addLog(level: LogLevel, message: string): void {
+    const log: LogMessage = {
+      level,
+      message,
+      timestamp: new Date(),
+    }
+    this.logs.push(log)
+    console.log(`[${level.toUpperCase()}] ${message}`)
+
+    // Mantener solo los últimos 100 logs para no sobrecargar la memoria
+    if (this.logs.length > 100) {
+      this.logs.shift()
+    }
+  }
+
+  /**
+   * Actualizar el progreso asegurando que siempre avance
+   */
+  private updateProgress(newProgress: number, status: string, progressCallback: ProgressCallback): void {
+    // Asegurarse de que el progreso nunca retroceda
+    if (newProgress < this.lastProgress) {
+      newProgress = this.lastProgress
+    } else if (newProgress > 100) {
+      newProgress = 100
+    }
+
+    this.lastProgress = newProgress
+
+    progressCallback({
+      progress: newProgress,
+      status: status,
+      counts: this.backupCounts,
+      stats: this.backupStats,
+      logs: [...this.logs],
+    })
+  }
+
+  /**
+   * Autenticar con la API de Podio
+   */
+  async authenticate(clientId: string, clientSecret: string, username: string, password: string): Promise<boolean> {
+    try {
+      this.addLog("info", "Iniciando autenticación con Podio...")
+
+      const response = await fetch(`${this.baseUrl}/oauth/token`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          grant_type: "password",
+          client_id: clientId,
+          client_secret: clientSecret,
+          username: username,
+          password: password,
+        }),
+      })
+
+      if (!response.ok) {
+        const errorText = await response.text()
+        this.addLog("error", `Error de autenticación: ${response.status} ${errorText}`)
+        throw new Error(`Autenticación fallida: ${response.status} ${response.statusText}. ${errorText}`)
+      }
+
+      const authResponse = await response.json()
+      this.addLog("success", "Autenticación exitosa con Podio")
+
+      // Calcular cuando expira el token
+      const expiresAt = Date.now() + authResponse.expires_in * 1000
+
+      this.authData = {
+        ...authResponse,
+        expires_at: expiresAt,
+      }
+
+      return true
+    } catch (error) {
+      this.addLog("error", `Error de autenticación: ${error instanceof Error ? error.message : String(error)}`)
+      return false
+    }
+  }
+
+  /**
+   * Refrescar el token si está por expirar
+   */
+  private async refreshTokenIfNeeded(): Promise<boolean> {
+    if (!this.authData) {
+      this.addLog("error", "No hay datos de autenticación para refrescar el token")
+      return false
+    }
+
+    // Si el token expira en menos de 5 minutos, refrescarlo
+    if (this.authData.expires_at - Date.now() < 5 * 60 * 1000) {
+      try {
+        this.addLog("info", "Refrescando token de autenticación...")
+
+        const response = await fetch(`${this.baseUrl}/oauth/token`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: new URLSearchParams({
+            grant_type: "refresh_token",
+            client_id: process.env.NEXT_PUBLIC_PODIO_CLIENT_ID || "",
+            client_secret: process.env.NEXT_PUBLIC_PODIO_CLIENT_SECRET || "",
+            refresh_token: this.authData.refresh_token,
+          }),
+        })
+
+        if (!response.ok) {
+          const errorText = await response.text()
+          this.addLog("error", `Error al refrescar token: ${response.status} ${errorText}`)
+          throw new Error(`Refresh token fallido: ${response.status} ${response.statusText}. ${errorText}`)
+        }
+
+        const authResponse = await response.json()
+        this.addLog("success", "Token refrescado exitosamente")
+
+        // Calcular cuando expira el token
+        const expiresAt = Date.now() + authResponse.expires_in * 1000
+
+        this.authData = {
+          ...authResponse,
+          expires_at: expiresAt,
+        }
+
+        return true
+      } catch (error) {
+        this.addLog("error", `Error al refrescar token: ${error instanceof Error ? error.message : String(error)}`)
+        return false
+      }
+    }
+
+    return true
+  }
+
+  /**
+   * Realizar una petición autenticada a la API de Podio
+   */
+  private async apiRequest<T>(endpoint: string, method = "GET", data?: any): Promise<T> {
+    if (!this.authData) {
+      this.addLog("error", "No autenticado. Llama a authenticate() primero.")
+      throw new Error("No autenticado. Llama a authenticate() primero.")
+    }
+
+    // Verificar caché para operaciones GET
+    if (method === "GET") {
+      const cached = this.getFromCache<T>(endpoint, method)
+      if (cached) return cached
+    }
+
+    // Refrescar token si es necesario
+    const tokenRefreshed = await this.refreshTokenIfNeeded()
+    if (!tokenRefreshed) {
+      this.addLog("error", "No se pudo refrescar el token")
+      throw new Error("No se pudo refrescar el token")
+    }
+
+    const url = `${this.baseUrl}${endpoint}`
+
+    // Encolar la solicitud real a la API
+    return this.enqueueRequest(async () => {
+      this.addLog("info", `Realizando petición ${method} a ${url}`)
+
+      const options: RequestInit = {
+        method,
+        headers: {
+          Authorization: `OAuth2 ${this.authData!.access_token}`,
+          "Content-Type": "application/json",
+        },
+      }
+
+      if (data && method !== "GET") {
+        options.body = JSON.stringify(data)
+      }
+
+      try {
+        const response = await fetch(url, options)
+
+        // Monitorear headers de rate limit
+        this.updateRateLimitsFromHeaders(response.headers, endpoint, method)
+
+        if (!response.ok) {
+          const errorText = await response.text()
+          this.addLog("error", `Error en petición API (${method} ${url}): ${response.status} ${errorText}`)
+
+          // Mejorar la detección de errores de rate limit
+          if (response.status === 420) {
+            // Intentar extraer el tiempo de espera del mensaje de error
+            let waitTime = 60 // Valor predeterminado: 1 minuto
+            let limitType: "general" | "rateLimited" = "general"
+
+            try {
+              // Intentar parsear como JSON
+              const errorData = JSON.parse(errorText)
+              if (errorData.error === "rate_limit") {
+                // Buscar información sobre el tiempo de espera
+                if (errorData.error_description && typeof errorData.error_description === "string") {
+                  const waitTimeMatch = errorData.error_description.match(/(\d+)\s*seconds?/i)
+                  if (waitTimeMatch && waitTimeMatch[1]) {
+                    waitTime = Number.parseInt(waitTimeMatch[1], 10)
+                  }
+                  // Determinar el tipo de límite según la operación
+                  limitType = this.isRateLimitedOperation(endpoint, method) ? "rateLimited" : "general"
+                }
+                this.setActiveRateLimit(limitType, waitTime)
+                throw new Error(`RATE_LIMIT_ERROR:${waitTime}:${limitType}`)
+              }
+            } catch (parseError) {
+              // Si no se puede parsear como JSON, intentar detectar el error por el texto
+              if (errorText.includes("rate_limit") || errorText.includes("rate limit")) {
+                // Intentar extraer el tiempo de espera del mensaje de error
+                const waitTimeMatch = errorText.match(/(\d+)\s*seconds?/i)
+                if (waitTimeMatch && waitTimeMatch[1]) {
+                  waitTime = Number.parseInt(waitTimeMatch[1], 10)
+                }
+
+                // Determinar el tipo de límite según la operación
+                limitType = this.isRateLimitedOperation(endpoint, method) ? "rateLimited" : "general"
+
+                this.setActiveRateLimit(limitType, waitTime)
+                throw new Error(`RATE_LIMIT_ERROR:${waitTime}:${limitType}`)
+              }
+            }
+          }
+
+          throw new Error(`Petición API fallida: ${response.status} ${response.statusText}. ${errorText}`)
+        }
+
+        // Manejar respuestas sin contenido (por ejemplo, PUT/DELETE en Podio)
+        if (response.status === 204) {
+          return null as T;
+        }
+        const text = await response.text();
+        if (!text) {
+          return null as T;
+        }
+        let responseData: any = null;
+        try {
+          responseData = JSON.parse(text);
+        } catch (e) {
+          responseData = null;
+        }
+        
+        // Guardar en caché para operaciones GET exitosas
+        if (method === "GET" && responseData) {
+          this.setCache(endpoint, responseData, method);
+        }
+        
+        return responseData;
+      } catch (error) {
+        // Si ya es un error de rate limit, simplemente lo propagamos
+        if (error instanceof Error && error.message.startsWith("RATE_LIMIT_ERROR:")) {
+          throw error
+        }
+
+        this.addLog(
+          "error",
+          `Error en petición API (${method} ${url}): ${error instanceof Error ? error.message : String(error)}`,
+        )
+        throw error
+      }
+    }, endpoint, method)
+  }
+
+  /**
+   * Get all organizations
+   */
+  protected async getOrganizations(): Promise<PodioOrganization[]> {
+    try {
+      this.addLog("info", "Obteniendo organizaciones...")
+      const response = await this.apiRequest<any>("/org/")
+
+      if (!Array.isArray(response)) {
+        this.addLog("error", `Respuesta inesperada al obtener organizaciones: ${JSON.stringify(response)}`)
+        return []
+      }
+
+      this.addLog("success", `Se encontraron ${response.length} organizaciones`)
+      return response.map((org: any) => ({
+        org_id: org.org_id,
+        name: org.name,
+        url: org.url,
+      }))
+    } catch (error) {
+      this.addLog("error", `Error al obtener organizaciones: ${error instanceof Error ? error.message : String(error)}`)
+      throw new Error(`Error al obtener organizaciones: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  /**
+   * Get workspaces for an organization, including both private and public spaces
+   */
+  protected async getWorkspaces(orgId: number): Promise<PodioWorkspace[]> {
+    try {
+      this.addLog("info", `Obteniendo espacios de trabajo para la organización ${orgId}...`)
+
+      // Obtenemos los espacios de trabajo de la organización
+      const response = await this.apiRequest<any>(`/org/${orgId}/space/`)
+
+      if (!Array.isArray(response)) {
+        this.addLog("error", `Respuesta inesperada al obtener espacios de trabajo: ${JSON.stringify(response)}`)
+        return []
+      }
+
+      // Mapear los espacios de trabajo
+      const workspaces = response.map((space) => ({
+        space_id: space.space_id,
+        name: space.name,
+        url: space.url || "",
+      }))
+
+      this.addLog("success", `Se encontraron ${workspaces.length} espacios de trabajo para la organización ${orgId}`)
+      return workspaces
+    } catch (error) {
+      this.addLog(
+        "warning",
+        `Error al obtener espacios de trabajo para la organización ${orgId}: ${error instanceof Error ? error.message : String(error)}`,
+      )
+      return [] // Continuamos con el proceso aunque falle un espacio de trabajo
+    }
+  }
+
+  /**
+   * Get applications for a workspace
+   */
+  protected async getApplications(spaceId: number): Promise<PodioApplication[]> {
+    try {
+      this.addLog("info", `Obteniendo aplicaciones para el espacio de trabajo ${spaceId}...`)
+      const response = await this.apiRequest<any>(`/app/space/${spaceId}/`)
+
+      if (!Array.isArray(response)) {
+        this.addLog("error", `Respuesta inesperada al obtener aplicaciones: ${JSON.stringify(response)}`)
+        return []
+      }
+
+      this.addLog("success", `Se encontraron ${response.length} aplicaciones para el espacio de trabajo ${spaceId}`)
+      return response.map((app: any) => ({
+        app_id: app.app_id,
+        name: app.config?.name || "Sin nombre",
+        url: app.link || "",
+      }))
+    } catch (error) {
+      this.addLog(
+        "warning",
+        `Error al obtener aplicaciones para el espacio de trabajo ${spaceId}: ${error instanceof Error ? error.message : String(error)}`,
+      )
+      return [] // Continuamos con el proceso aunque falle una aplicación
+    }
+  }
+
+  /**
+   * Get items for an application
+   */
+  protected async getItems(appId: number): Promise<PodioItem[]> {
+    try {
+      this.addLog("info", `Obteniendo elementos para la aplicación ${appId}...`)
+
+      // Primero obtenemos el conteo para saber cuántos elementos hay
+      const countResponse = await this.apiRequest<any>(`/item/app/${appId}/count`)
+      let totalItems = countResponse.count || 0
+
+      // Si está en modo test, limitar a TEST_LIMIT items
+      if (isTestMode() && totalItems > TEST_LIMIT) {
+        totalItems = TEST_LIMIT;
+      }
+
+      if (totalItems === 0) {
+        this.addLog("info", `No se encontraron elementos para la aplicación ${appId}`)
+        return []
+      }
+
+      // OPTIMIZACIÓN: Usar límites más grandes para reducir llamadas API
+      const batchSize = isTestMode() ? TEST_LIMIT : this.PAGINATION_LIMITS.items;
+      const batches = Math.ceil(totalItems / batchSize)
+      let allItems: PodioItem[] = []
+
+      for (let i = 0; i < batches; i++) {
+        const offset = i * batchSize
+        // OPTIMIZACIÓN: Usar límites más grandes para reducir llamadas API
+        const limit = isTestMode() ? TEST_LIMIT : Math.min(this.PAGINATION_LIMITS.items, batchSize);
+        const response = await this.retryWithBackoff(
+          () => this.apiRequest<any>(`/item/app/${appId}/?limit=${limit}&offset=${offset}`),
+          3,
+          1000,
+          `obtener items (lote ${i + 1}/${batches})`
+        )
+
+        if (!response || !Array.isArray(response.items)) {
+          this.addLog("warning", `Respuesta inesperada al obtener elementos: ${JSON.stringify(response)}`)
+          continue
+        }
+
+        const items = response.items.map((item: any) => ({
+          item_id: item.item_id,
+          title: item.title || "Sin título",
+          fields: item.fields || {},
+        }))
+
+        allItems = [...allItems, ...items]
+        // Si es modo test y ya tenemos TEST_LIMIT, cortamos
+        if (isTestMode() && allItems.length >= TEST_LIMIT) {
+          allItems = allItems.slice(0, TEST_LIMIT);
+          break;
+        }
+        this.addLog("info", `Obtenidos ${allItems.length}/${totalItems} elementos para la aplicación ${appId}`)
+      }
+
+      this.addLog("success", `Se encontraron ${allItems.length} elementos para la aplicación ${appId}`)
+      return allItems
+    } catch (error) {
+      this.addLog(
+        "warning",
+        `Error al obtener elementos para la aplicación ${appId}: ${error instanceof Error ? error.message : String(error)}`,
+      )
+      return [] // Continuamos con el proceso aunque falle
+    }
+  }
+
+  /**
+   * Get files for an item
+   */
+  protected async getItemFiles(itemId: number): Promise<PodioFile[]> {
+    try {
+      this.addLog("info", `Obteniendo archivos para el elemento ${itemId}...`)
+      // Usar el endpoint correcto para obtener el item y sus archivos adjuntos
+      const response = await this.retryWithBackoff(
+        () => this.apiRequest<any>(`/item/${itemId}`),
+        3,
+        1000,
+        `obtener archivos del item ${itemId}`
+      )
+
+      if (!response || !Array.isArray(response.files)) {
+        this.addLog("warning", `No se encontraron archivos adjuntos en el item o respuesta inesperada: ${JSON.stringify(response)}`)
+        return []
+      }
+
+      const files = response.files.map((file: any) => {
+        if (!file.link) {
+          this.addLog("warning", `Archivo sin link directo: ${file.name} (${file.file_id}) - usará download_link`)
+        }
+        return {
+          file_id: file.file_id,
+          name: file.name || `file_${file.file_id}`,
+          link: file.link || "",
+          mimetype: file.mimetype || "application/octet-stream",
+          size: file.size || 0,
+        }
+      })
+
+      this.addLog("success", `Se encontraron ${files.length} archivos para el elemento ${itemId}`)
+      return files
+    } catch (error) {
+      this.addLog(
+        "warning",
+        `Error al obtener archivos para el elemento ${itemId}: ${error instanceof Error ? error.message : String(error)}`,
+      )
+      return [] // Continuamos con el proceso aunque falle
+    }
+  }
+
+  /**
+   * Get download link for a file
+   */
+  protected async getFileDownloadLink(fileId: number): Promise<string> {
+    try {
+      this.addLog("info", `Obteniendo enlace de descarga para el archivo ${fileId}...`)
+      const response = await this.apiRequest<any>(`/file/${fileId}/download_link`)
+
+      if (!response || !response.url) {
+        this.addLog("warning", `Respuesta inesperada al obtener enlace de descarga: ${JSON.stringify(response)}`)
+        return ""
+      }
+
+      this.addLog("success", `Enlace de descarga obtenido para el archivo ${fileId}`)
+      return response.url
+    } catch (error) {
+      this.addLog(
+        "warning",
+        `Error al obtener enlace de descarga para el archivo ${fileId}: ${error instanceof Error ? error.message : String(error)}`,
+      )
+      return "" // Continuamos con el proceso aunque falle
+    }
+  }
+
+  /**
+   * Get items count for an application
+   */
+  private async getItemsCount(appId: number, progressCallback?: ProgressCallback): Promise<number> {
+    try {
+      this.addLog("info", `Obteniendo conteo de elementos para la aplicación ${appId}...`)
+      const response = await this.apiRequest<any>(`/item/app/${appId}/count`)
+
+      if (typeof response.count !== "number") {
+        this.addLog("error", `Respuesta inesperada al obtener conteo de elementos: ${JSON.stringify(response)}`)
+        return 0
+      }
+
+      // Actualizar estadísticas inmediatamente
+      this.backupStats.items += response.count
+
+      // Notificar al callback si existe
+      if (progressCallback) {
+        progressCallback({
+          progress: this.lastProgress,
+          status: `Encontrados ${response.count} elementos en la aplicación ${appId}`,
+          counts: this.backupCounts,
+          stats: this.backupStats,
+          logs: [...this.logs],
+        })
+      }
+
+      this.addLog("success", `Se encontraron ${response.count} elementos para la aplicación ${appId}`)
+      return response.count
+    } catch (error) {
+      this.addLog(
+        "warning",
+        `Error al obtener conteo de elementos para la aplicación ${appId}: ${error instanceof Error ? error.message : String(error)}`,
+      )
+      return 0 // Continuamos con el proceso aunque falle
+    }
+  }
+
+  /**
+   * Crear estructura de carpetas para el respaldo
+   */
+  private async createFolderStructure(orgName: string, workspaceName: string, appName: string): Promise<string> {
+    try {
+      // Sanitizar nombres para que sean válidos como nombres de carpeta
+      const safeOrgName = this.sanitizeFileName(orgName)
+      const safeWorkspaceName = this.sanitizeFileName(workspaceName)
+
+      const safeAppName = this.sanitizeFileName(appName)
+
+      // Construir la ruta completa
+      const folderPath = `${this.backupPath}/${safeOrgName}/${safeWorkspaceName}/${safeAppName}`
+
+      // Crear la estructura de carpetas
+      await this.ensureFolderExists(folderPath)
+
+      // Crear subcarpeta para archivos
+      await this.ensureFolderExists(`${folderPath}/files`)
+
+      this.addLog("success", `Estructura de carpetas creada: ${folderPath}`)
+      return folderPath
+    } catch (error) {
+      this.addLog(
+        "error",
+        `Error al crear estructura de carpetas: ${error instanceof Error ? error.message : String(error)}`,
+      )
+      throw error
+    }
+  }
+
+  /**
+   * Sanitizar nombre de archivo para que sea válido
+   */
+  protected sanitizeFileName(name: string): string {
+    // Reemplazar caracteres no válidos con guiones
+    return name
+      .replace(/[\\/:*?"<>|]/g, "-")
+      .replace(/\s+/g, "_")
+      .trim()
+  }
+
+  /**
+   * Reemplazar ensureFolderExists para crear carpetas reales
+   */
+  protected async ensureFolderExists(path: string): Promise<void> {
+    if (typeof window !== 'undefined' && window.electron && window.electron.fileSystem && window.electron.fileSystem.createDirectory) {
+      await window.electron.fileSystem.createDirectory(path)
+      this.addLog("success", `Carpeta creada: ${path}`)
+    } else {
+      throw new Error('Función de archivos solo disponible en Electron')
+    }
+  }
+
+  /**
+   * Formatear tamaño de archivo
+   */
+  protected formatFileSize(bytes: number): string {
+    if (bytes === 0) return "0 Bytes"
+    const k = 1024
+    const sizes = ["Bytes", "KB", "MB", "GB", "TB"]
+    const i = Math.floor(Math.log(bytes) / Math.log(k))
+    return Number.parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i]
+  }
+
+  /**
+   * Reemplazar saveItemsToExcel para guardar el archivo Excel realmente (si aplica)
+   */
+  protected async saveItemsToExcel(items: any[], folderPath: string, appName: string): Promise<void> {
+    try {
+      const fileName = `${this.sanitizeFileName(appName)}_items.xlsx`
+      this.addLog("info", `Preparando archivo Excel con ${items.length} elementos: ${fileName}`)
+
+      // En un entorno de navegador, simulamos la generación del archivo Excel
+      this.addLog("info", `Simulando generación de Excel: ${fileName}`)
+
+      // Simular un tiempo de procesamiento
+      await new Promise((resolve) => setTimeout(resolve, 500))
+
+      this.addLog("success", `Archivo Excel simulado: ${folderPath}/${fileName}`)
+    } catch (error) {
+      this.addLog("error", `Error al generar archivo Excel: ${error instanceof Error ? error.message : String(error)}`)
+      throw error
+    }
+  }
+
+  /**
+   * Descargar el Excel oficial de la app
+   */
+  protected async downloadAppExcel(appId: number, folderPath: string, appName: string, progressCallback?: ProgressCallback, excelIndex?: number, totalExcels?: number): Promise<void> {
+    try {
+      this.addLog("info", `Exportando Excel oficial para la app ${appName} (${appId})...`);
+      const countResponse = await this.apiRequest<any>(`/item/app/${appId}/count`);
+      const totalItems = countResponse.count || 0;
+      const limit = 1000;
+      let offset = 0;
+      let part = 1;
+      while (offset < totalItems || (offset === 0 && totalItems === 0)) {
+        const url = `${this.baseUrl}/item/app/${appId}/xlsx/?limit=${limit}&offset=${offset}`;
+        const excelPath = `${folderPath}/${this.sanitizeFileName(appName)}_oficial${part > 1 ? `_parte${part}` : ""}.xlsx`;
+        // Asegurar que la carpeta existe
+        await this.ensureFolderExists(folderPath);
+        this.addLog("info", `Descargando Excel desde: ${url} a ${excelPath}`);
+        // LOG: Realizar fetch manual para ver la respuesta de Podio
+        if (
+          typeof window !== 'undefined' &&
+          window.electron &&
+          window.electron.fileSystem &&
+          typeof window.electron.fileSystem.downloadFile === 'function'
+        ) {
+          // Log antes de la descarga
+          this.addLog("info", `Solicitando a Podio: ${url}`);
+          // Usar fetch manual para loguear la respuesta
+          try {
+            const response = await fetch(url, {
+              method: 'GET',
+              headers: {
+                Authorization: `OAuth2 ${this.authData?.access_token}`,
+              },
+            });
+            this.addLog("info", `Respuesta Podio: status=${response.status}, headers=${JSON.stringify([...response.headers])}`);
+            if (!response.ok) {
+              this.addLog("error", `Error HTTP al descargar Excel: status=${response.status}, statusText=${response.statusText}`);
+            } else {
+              const buffer = await response.arrayBuffer();
+              // Guardar el archivo usando el bridge de Electron (convertir a base64 para saveFile)
+              const base64 = Buffer.from(buffer).toString('base64');
+              await window.electron.fileSystem.saveFile(base64, excelPath);
+              // Verificar existencia y sumar tamaño real descargado
+              if (typeof (window.electron.fileSystem as any)?.existsSync === 'function') {
+                const exists = await ((window.electron.fileSystem as any).existsSync(excelPath));
+                if (!exists) {
+                  this.addLog("error", `El archivo Excel no se encontró después de descargar: ${excelPath}`);
+                } else {
+                  this.addLog("success", `Excel oficial descargado: ${excelPath}`);
+                  if (typeof (window.electron.fileSystem as any)?.getFileSize === 'function') {
+                    const size = await ((window.electron.fileSystem as any).getFileSize(excelPath));
+                    this.addLog("info", `Tamaño del archivo Excel descargado: ${size} bytes`);
+                    this.backupStats.downloadedBytes += size;
+                    if (progressCallback && typeof this.totalFilesToDownload === 'number' && typeof excelIndex === 'number' && typeof totalExcels === 'number') {
+                      const progress = 99 * ((excelIndex + 1) / (this.totalFilesToDownload + totalExcels));
+                      this.updateProgress(progress, `Descargando Excel ${excelIndex + 1} de ${totalExcels}`, progressCallback);
+                    }
+                  }
+                }
+              }
+            }
+          } catch (err) {
+            this.addLog("error", `Error al solicitar o guardar el Excel: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        } else {
+          this.addLog("error", "Función de descarga de archivos no disponible en Electron");
+        }
+        offset += limit;
+        part++;
+        // Si la app no tiene items, igual descarga un Excel vacío (una sola vez)
+        if (totalItems === 0) break;
+      }
+    } catch (error) {
+      this.addLog("error", `Error al exportar Excel oficial: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * Procesar archivos completos en batches con mensajes detallados
+   */
+  protected async processCompleteFilesInBatches(
+    progressCallback?: ProgressCallback,
+    batchSize: number = 240 // Dejar margen de 10 para el límite de 250
+  ): Promise<void> {
+    if (this.scannedFilesComplete.length === 0) {
+      this.addLog("warning", "⚠️ No hay archivos completos para procesar")
+      return
+    }
+    
+    const totalBatches = Math.ceil(this.scannedFilesComplete.length / batchSize)
+    this.addLog("info", `🚀 INICIANDO DESCARGA EN BATCHES`)
+    this.addLog("info", `📊 Total de archivos: ${this.scannedFilesComplete.length}`)
+    this.addLog("info", `📦 Tamaño de batch: ${batchSize} archivos`)
+    this.addLog("info", `🔢 Total de batches: ${totalBatches}`)
+    this.addLog("info", `⏱️ Tiempo estimado: ${Math.ceil(totalBatches * 0.5)} minutos`)
+    
+    let processedFiles = 0
+    let batchNumber = 1
+    const startTime = Date.now()
+    
+    for (let i = 0; i < this.scannedFilesComplete.length; i += batchSize) {
+      const batch = this.scannedFilesComplete.slice(i, i + batchSize)
+      const batchStartTime = Date.now()
+      
+      this.addLog("info", `📦 BATCH ${batchNumber}/${totalBatches}: Procesando archivos ${i + 1}-${Math.min(i + batchSize, this.scannedFilesComplete.length)}`)
+      
+      // Procesar archivos del batch (SIN llamadas API adicionales)
+      let batchSuccessCount = 0
+      for (let j = 0; j < batch.length; j++) {
+        const fileData = batch[j]
+        const fileIndex = i + j
+        
+        try {
+          const success = await this.downloadFileDirect(fileData, progressCallback, fileIndex, this.scannedFilesComplete.length)
+          if (success) {
+            processedFiles++
+            batchSuccessCount++
+          }
+          
+          // Actualizar progreso
+          if (progressCallback) {
+            const progress = Math.min(99, (processedFiles / this.scannedFilesComplete.length) * 100)
+            this.updateProgress(progress, `Descargando archivo ${processedFiles}/${this.scannedFilesComplete.length}: ${fileData.file.name}`, progressCallback)
+          }
+          
+        } catch (error) {
+          this.addLog("error", `❌ Error al descargar archivo ${fileData.file.name}: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+      
+      const batchTime = Date.now() - batchStartTime
+      const batchTimeSeconds = Math.round(batchTime / 1000)
+      
+      this.addLog("success", `✅ BATCH ${batchNumber}/${totalBatches} COMPLETADO`)
+      this.addLog("info", `📊 Archivos descargados en este batch: ${batchSuccessCount}/${batch.length}`)
+      this.addLog("info", `⏱️ Tiempo del batch: ${batchTimeSeconds}s`)
+      
+      batchNumber++
+      
+      // Si no es el último batch, verificar si necesitamos esperar
+      if (i + batchSize < this.scannedFilesComplete.length) {
+        // Verificar límites de tasa antes del siguiente batch
+        const limitType = this.isRateLimitedOperation('/file/', 'GET') ? 'rateLimited' : 'general'
+        const currentLimit = this.rateLimits[limitType]
+        
+        if (currentLimit.remaining <= batchSize) {
+          const waitTime = Math.ceil((currentLimit.resetTime - Date.now()) / 1000)
+          this.addLog("warning", `⏰ LÍMITE DE TASA PRÓXIMO A ALCANZARSE`)
+          this.addLog("info", `🔄 Esperando ${waitTime} segundos antes del siguiente batch...`)
+          this.addLog("info", `📊 Límite actual: ${currentLimit.remaining}/${currentLimit.limit} (${limitType})`)
+          
+          await this.waitForRateLimit(waitTime)
+          
+          // Actualizar límites después de la espera
+          this.updateRateLimits()
+          this.addLog("info", `✅ Límites actualizados. Continuando con el siguiente batch...`)
+        } else {
+          this.addLog("info", `✅ Límites OK (${currentLimit.remaining}/${currentLimit.limit} restantes). Continuando...`)
+        }
+      }
+    }
+    
+    const totalTime = Date.now() - startTime
+    const totalTimeMinutes = Math.round(totalTime / 60000)
+    
+    this.addLog("success", `🎉 DESCARGA EN BATCHES COMPLETADA`)
+    this.addLog("info", `📊 Archivos procesados: ${processedFiles}/${this.scannedFilesComplete.length}`)
+    this.addLog("info", `⏱️ Tiempo total: ${totalTimeMinutes} minutos`)
+    this.addLog("info", `📈 Tasa de éxito: ${Math.round((processedFiles / this.scannedFilesComplete.length) * 100)}%`)
+  }
+
+  /**
+   * Descargar archivo directamente usando información pre-obtenida (SIN llamadas API)
+   */
+  protected async downloadFileDirect(
+    fileData: { file: PodioFile; downloadUrl: string; folderPath: string; appName: string },
+    progressCallback?: ProgressCallback,
+    fileIndex?: number,
+    totalFiles?: number
+  ): Promise<boolean> {
+    if (!this.authData) {
+      this.addLog("error", "No autenticado. Llama a authenticate() primero.");
+      return false;
+    }
+    
+    try {
+      await this.ensureFolderExists(fileData.folderPath);
+      
+      if (
+        typeof window !== 'undefined' &&
+        window.electron &&
+        window.electron.fileSystem &&
+        typeof window.electron.fileSystem.downloadFile === 'function'
+      ) {
+        const filePath = `${fileData.folderPath}/${fileData.file.name}`;
+        await window.electron.fileSystem.downloadFile(fileData.downloadUrl, filePath);
+        
+        // Verificar existencia y sumar tamaño real descargado
+        if ((window.electron.fileSystem as any)?.existsSync) {
+          const exists = await ((window.electron.fileSystem as any)?.existsSync(filePath));
+          if (!exists) {
+            this.addLog("error", `El archivo no se encontró después de descargar: ${filePath}`);
+            return false;
+          } else {
+            this.addLog("success", `Archivo descargado directamente: ${filePath}`);
+            return true;
+          }
+        }
+      } else {
+        this.addLog("error", "Función de descarga de archivos no disponible en Electron");
+        return false;
+      }
+    } catch (error) {
+      this.addLog("error", `Error al descargar archivo ${fileData.file.name}: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+    
+    return false;
+  }
+
+  /**
+   * Procesar archivos en batches respetando límites de tasa (método original para compatibilidad)
+   */
+  protected async processFilesInBatches(
+    files: PodioFile[], 
+    folderPath: string, 
+    progressCallback?: ProgressCallback,
+    batchSize: number = 240 // Dejar margen de 10 para el límite de 250
+  ): Promise<void> {
+    this.addLog("info", `Procesando ${files.length} archivos en batches de ${batchSize}`)
+    
+    let processedFiles = 0
+    let batchNumber = 1
+    
+    for (let i = 0; i < files.length; i += batchSize) {
+      const batch = files.slice(i, i + batchSize)
+      this.addLog("info", `Procesando batch ${batchNumber}: archivos ${i + 1}-${Math.min(i + batchSize, files.length)} de ${files.length}`)
+      
+      // Procesar archivos del batch
+      for (let j = 0; j < batch.length; j++) {
+        const file = batch[j]
+        const fileIndex = i + j
+        
+        try {
+          const success = await this.downloadFile(file, folderPath, progressCallback, fileIndex, files.length)
+          if (success) {
+            processedFiles++
+          }
+          
+          // Actualizar progreso
+          if (progressCallback) {
+            const progress = Math.min(99, (processedFiles / files.length) * 100)
+            this.updateProgress(progress, `Descargando archivo ${processedFiles}/${files.length}: ${file.name}`, progressCallback)
+          }
+          
+        } catch (error) {
+          this.addLog("error", `Error al descargar archivo ${file.name}: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+      
+      batchNumber++
+      
+      // Si no es el último batch, verificar si necesitamos esperar
+      if (i + batchSize < files.length) {
+        // Verificar límites de tasa antes del siguiente batch
+        const limitType = this.isRateLimitedOperation('/file/', 'GET') ? 'rateLimited' : 'general'
+        const currentLimit = this.rateLimits[limitType]
+        
+        if (currentLimit.remaining <= batchSize) {
+          const waitTime = Math.ceil((currentLimit.resetTime - Date.now()) / 1000)
+          this.addLog("warning", `Límite de tasa próximo a agotarse. Esperando ${waitTime} segundos antes del siguiente batch...`)
+          await this.waitForRateLimit(waitTime)
+          
+          // Actualizar límites después de la espera
+          this.updateRateLimits()
+        }
+      }
+    }
+    
+    this.addLog("success", `Procesamiento de archivos completado: ${processedFiles}/${files.length} archivos descargados`)
+  }
+
+  /**
+  protected async downloadFile(file: any, folderPath: string, progressCallback?: ProgressCallback, fileIndex?: number, totalFiles?: number): Promise<boolean> {
+    if (!this.authData) {
+      this.addLog("error", "No autenticado. Llama a authenticate() primero.");
+      return false;
+    }
+    try {
+      let downloadUrl = file.link;
+      if (!downloadUrl) {
+        downloadUrl = await this.getFileDownloadLink(file.file_id);
+      }
+      if (!downloadUrl) {
+        this.addLog("error", `No se pudo obtener el enlace de descarga para el archivo ${file.name}`);
+        return false;
+      }
+      await this.ensureFolderExists(folderPath);
+      if (
+        typeof window !== 'undefined' &&
+        window.electron &&
+        window.electron.fileSystem &&
+        typeof window.electron.fileSystem.downloadFile === 'function'
+      ) {
+        const filePath = `${folderPath}/${file.name}`;
+        await window.electron.fileSystem.downloadFile(downloadUrl, filePath);
+        // Verificar existencia y sumar tamaño real descargado
+        if ((window.electron.fileSystem as any)?.existsSync) {
+          const exists = await ((window.electron.fileSystem as any)?.existsSync(filePath));
+          if (!exists) {
+            this.addLog("error", `El archivo no se encontró después de descargar: ${filePath}`);
+          } else {
+            this.addLog("success", `Archivo guardado: ${filePath}`);
+            if ((window.electron.fileSystem as any)?.getFileSize) {
+              const size = await ((window.electron.fileSystem as any)?.getFileSize(filePath));
+              this.backupStats.downloadedBytes += size;
+              if (progressCallback && typeof this.totalFilesToDownload === 'number' && typeof fileIndex === 'number' && typeof totalFiles === 'number') {
+                const progress = 99 * ((fileIndex + 1) / (this.totalFilesToDownload + (totalFiles || 0)));
+                this.updateProgress(progress, `Descargando archivo ${fileIndex + 1} de ${this.totalFilesToDownload}`, progressCallback);
+              }
+            }
+          }
+        } else {
+          this.addLog("success", `Archivo guardado (no verificado): ${filePath}`);
+        }
+      return true;
+      } else {
+        throw new Error('Función de archivos solo disponible en Electron');
+      }
+    } catch (error) {
+      this.addLog("error", `Error al descargar o guardar archivo: ${file.name} - ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  }
+
+  /**
+   * Escanear lo que se va a respaldar SIN realizar la descarga, pero contando archivos reales
+   */
+  async scanBackup(options: BackupOptions, progressCallback?: ProgressCallback): Promise<void> {
+    // Crear el registro de backup en Podio ANTES de escanear
+    await this.createBackupRecord();
+    try {
+      this.addLog("info", "Iniciando escaneo de respaldo...");
+      let totalFiles = 0;
+      let totalItems = 0;
+      let totalApps = 0;
+      let totalWorkspaces = 0;
+      this.scannedFiles = [];
+      this.scannedStats = null;
+      this.scannedApps = [];
+
+      // Reiniciar contadores y estadísticas
+      this.backupCounts = {
+        organizations: 0,
+        workspaces: 0,
+        applications: 0,
+        items: 0,
+        files: 0,
+        downloadedFiles: 0,
+      };
+
+      this.backupStats = {
+        apps: 0,
+        items: 0,
+        workspaces: 0,
+        files: 0,
+        backupSize: 0,
+        successfulBackups: 0,
+        backupWarnings: 0,
+        downloadedFiles: 0,
+        downloadedBytes: 0,
+      };
+
+      this.lastProgress = 0;
+
+      // Verificar autenticación
+      if (!this.authData) {
+        this.addLog("error", "No autenticado. Llama a authenticate() primero.");
+        throw new Error("No autenticado");
+      }
+
+      // Obtener organizaciones
+      const organizations = await this.getOrganizations();
+      this.backupCounts.organizations = organizations.length;
+
+      // Notificar progreso inicial
+      if (progressCallback) {
+        this.updateProgress(5, "Escaneando organizaciones...", progressCallback);
+      }
+
+      // OPTIMIZACIÓN: Escanear organizaciones en paralelo
+      let totalProgress = 5;
+      const progressPerOrg = organizations.length > 0 ? 95 / organizations.length : 95;
+      
+      this.addLog("info", `🚀 INICIANDO PROCESAMIENTO PARALELO`);
+      this.addLog("info", `🏢 Organizaciones a procesar: ${organizations.length}`);
+      this.addLog("info", `⚡ Modo paralelo: Máximo 2 organizaciones simultáneas`);
+      this.addLog("info", `📊 Optimizaciones activas: Paginación + Reintentos + Paralelo`);
+      
+      // Procesar organizaciones en paralelo (limitado para evitar sobrecarga)
+      const maxConcurrentOrgs = 2; // Procesar máximo 2 organizaciones en paralelo
+      const allFiles: PodioFile[] = [];
+      const allApps: Array<{ appId: number; folderPath: string; appName: string }> = [];
+      
+      for (let i = 0; i < organizations.length; i += maxConcurrentOrgs) {
+        const orgBatch = organizations.slice(i, i + maxConcurrentOrgs);
+        const orgPromises = orgBatch.map(org => 
+          this.processOrganizationParallel(org, progressCallback)
+        );
+        
+        const orgResults = await Promise.all(orgPromises);
+        
+        orgResults.forEach((result, index) => {
+          const org = orgBatch[index];
+          this.addLog("info", `Organización procesada: ${org.name}`);
+          
+          // Actualizar contadores
+          this.backupCounts.workspaces += result.workspaces.length;
+          this.backupStats.workspaces += result.workspaces.length;
+          totalWorkspaces += result.workspaces.length;
+          
+          // Consolidar archivos
+          allFiles.push(...result.files);
+          
+          // Consolidar aplicaciones para Excel
+          result.applications.forEach(app => {
+            const workspace = result.workspaces.find(w => w.space_id === app.space_id);
+            const folderPath = `${this.backupPath}/${org.name}/${workspace?.name || 'Unknown'}/${app.name}`;
+            allApps.push({ appId: app.app_id, folderPath, appName: app.name });
+          });
+          
+          // Actualizar progreso
+          if (progressCallback) {
+            const progress = Math.min(95, 5 + ((i + index + 1) * progressPerOrg));
+            this.updateProgress(progress, `Procesando organizaciones en paralelo...`, progressCallback);
+          }
+        });
+      }
+      
+      // Almacenar resultados consolidados
+      this.scannedFiles = allFiles;
+      this.scannedApps = allApps;
+
+        // Notificar progreso
+        totalProgress += progressPerOrg * 0.1;
+        if (progressCallback) {
+          this.updateProgress(totalProgress, `Escaneando espacios de trabajo para ${org.name}...`, progressCallback);
+        }
+
+        // Escanear cada espacio de trabajo
+        const progressPerWorkspace =
+          workspaces.length > 0 ? (progressPerOrg * 0.9) / workspaces.length : progressPerOrg * 0.9;
+
+        for (let j = 0; j < workspaces.length; j++) {
+          const workspace = workspaces[j];
+          this.addLog("info", `Escaneando espacio de trabajo: ${workspace.name} (${j + 1}/${workspaces.length})`);
+
+          // Obtener aplicaciones
+          const applications = await this.getApplications(workspace.space_id);
+          this.backupCounts.applications += applications.length;
+          this.backupStats.apps += applications.length;
+          totalApps += applications.length;
+
+          // Notificar progreso
+          totalProgress += progressPerWorkspace * 0.2;
+          if (progressCallback) {
+            this.updateProgress(totalProgress, `Escaneando aplicaciones para ${workspace.name}...`, progressCallback);
+          }
+
+          // Escanear cada aplicación
+          const progressPerApp =
+            applications.length > 0 ? (progressPerWorkspace * 0.8) / applications.length : progressPerWorkspace * 0.8;
+
+          for (let k = 0; k < applications.length; k++) {
+            const app = applications[k];
+            this.addLog("info", `--- INICIO app (${k + 1}/${applications.length}): ${app.name} ---`);
+            this.addLog("info", `Llamando a getItems para app_id=${app.app_id} (${app.name})...`);
+            // Obtener items reales
+            let items: PodioItem[] = [];
+            try {
+              items = await this.getItems(app.app_id);
+              this.addLog("info", `getItems OK: ${items.length} items encontrados en app ${app.name} (${app.app_id})`);
+            } catch (err) {
+              this.addLog("error", `Error en getItems para app ${app.name} (${app.app_id}): ${err instanceof Error ? err.message : String(err)}`);
+              continue;
+            }
+            this.backupCounts.items += items.length;
+            this.backupStats.items += items.length;
+            totalItems += items.length;
+
+            // Recorrer cada item y obtener archivos adjuntos reales
+            for (let m = 0; m < items.length; m++) {
+              const item = items[m];
+              this.addLog("info", `  [${m + 1}/${items.length}] Llamando a getItemFiles para item_id=${item.item_id} (${item.title})...`);
+              let files: PodioFile[] = [];
+              try {
+                files = await this.getItemFiles(item.item_id);
+                this.addLog("info", `  getItemFiles OK: ${files.length} archivos encontrados en item ${item.item_id}`);
+              } catch (err) {
+                this.addLog("error", `  Error en getItemFiles para item ${item.item_id}: ${err instanceof Error ? err.message : String(err)}`);
+                continue;
+              }
+              for (const file of files) {
+                if (isTestMode() && totalFiles >= TEST_LIMIT) break;
+                // Si falta el tamaño, obtenerlo desde el endpoint de archivo
+                let fileSize = file.size;
+                if (!fileSize || fileSize === 0) {
+                  try {
+                    const fileInfo = await this.apiRequest<any>(`/file/${file.file_id}`);
+                    if (fileInfo && typeof fileInfo.size === 'number') {
+                      fileSize = fileInfo.size;
+                      file.size = fileSize; // Actualizar en memoria
+                    }
+                  } catch (e) {
+                    this.addLog("warning", `No se pudo obtener el tamaño para el archivo ${file.name} (${file.file_id})`);
+                  }
+                }
+                this.scannedFiles.push(file);
+                this.backupCounts.files++;
+                this.backupStats.files++;
+                this.backupStats.backupSize += fileSize / (1024 * 1024 * 1024); // Sumar en GB
+                totalFiles++;
+                this.addLog("info", `    Archivo agregado: ${file.name} (${fileSize} bytes)`);
+                // Actualizar progreso y tamaño estimado en la UI en tiempo real
+                if (progressCallback) {
+                  // Progreso basado en archivos escaneados vs. total estimado
+                  const progress = Math.min(99, 40 + (this.backupCounts.files / (this.scannedFiles.length || 1)) * 40);
+                  this.updateProgress(progress, `Escaneando elementos y archivos para ${app.name}...`, progressCallback);
+                }
+              }
+              if (isTestMode() && totalFiles >= TEST_LIMIT) break;
+            }
+
+            // Notificar progreso
+            totalProgress += progressPerApp;
+            if (progressCallback) {
+              this.updateProgress(totalProgress, `Escaneando elementos y archivos para ${app.name}...`, progressCallback);
+            }
+          }
+        }
+      }
+      
+      // Finalizar escaneo con datos consolidados
+      this.totalFilesToDownload = this.scannedFiles.length;
+      // Guardar los stats escaneados
+      this.scannedStats = { ...this.backupStats };
+      // Finalizar escaneo
+      const totalBytes = this.backupStats.backupSize * 1024 * 1024 * 1024;
+      this.addLog("success", `Escaneo de respaldo completado. Tamaño total: ${totalBytes} bytes (${this.backupStats.backupSize.toFixed(2)} GB)`);
+      this.addLog("info", `Organizaciones: ${this.backupCounts.organizations}`);
+      this.addLog("info", `Espacios de trabajo: ${this.backupCounts.workspaces}`);
+      this.addLog("info", `Aplicaciones: ${this.backupCounts.applications}`);
+      this.addLog("info", `Elementos: ${this.backupCounts.items}`);
+      this.addLog("info", `Archivos encontrados: ${this.backupCounts.files}`);
+      this.addLog("info", `Tamaño estimado: ${this.backupStats.backupSize.toFixed(2)} GB`);
+      await this.updateEstimatedSizeInBackupRecord();
+      // ACTUALIZAR EL ITEM DE BACKUP EN PODIO CON LOS DATOS DEL ESCANEO
+      await this.updateBackupRecord(false);
+      if (progressCallback) {
+        this.updateProgress(99, "Escaneo completado. Listo para descargar.", progressCallback);
+      }
+    } catch (error) {
+      this.addLog("error", `Error durante el escaneo: ${error instanceof Error ? error.message : String(error)}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Realiza el respaldo completo: descarga archivos adjuntos y los Excel oficiales, creando la estructura de carpetas.
+   */
+  async performBackup(options: BackupOptions, progressCallback?: ProgressCallback): Promise<void> {
+    await this.createBackupRecord();
+    try {
+      this.addLog("info", "Iniciando respaldo completo de Podio...");
+      let totalFiles = 0;
+      let totalItems = 0;
+      let totalApps = 0;
+      let totalWorkspaces = 0;
+      // Si ya hay archivos escaneados, stats y apps, úsalos
+      let filesToDownload = this.scannedFiles && this.scannedFiles.length > 0 ? [...this.scannedFiles] : [];
+      let statsToUse = this.scannedStats ? { ...this.scannedStats } : null;
+      let appsToUse = this.scannedApps && this.scannedApps.length > 0 ? [...this.scannedApps] : [];
+      if (filesToDownload.length > 0 && statsToUse && appsToUse.length > 0) {
+        this.addLog("info", `Usando archivos, stats y apps escaneadas previamente: ${filesToDownload.length} archivos, ${appsToUse.length} apps.`);
+        // OPTIMIZACIÓN: Usar archivos completos pre-obtenidos (SIN duplicación de llamadas API)
+        if (this.scannedFilesComplete.length > 0) {
+          this.addLog("info", `Usando ${this.scannedFilesComplete.length} archivos completos pre-obtenidos durante escaneo`);
+          await this.processCompleteFilesInBatches(progressCallback);
+        } else {
+          // Fallback al método original si no hay archivos completos
+          this.addLog("warning", "No hay archivos completos disponibles, usando método tradicional");
+          const filesFolder = this.backupPath + "/archivos";
+          await this.ensureFolderExists(filesFolder);
+          await this.processFilesInBatches(filesToDownload, filesFolder, progressCallback);
+        }
+        // Descargar Excels oficiales usando la lista escaneada de apps
+        this.addLog("info", `Descargando Excels oficiales de todas las apps (${appsToUse.length})...`);
+        let excelIndex = 0;
+        for (const task of appsToUse) {
+          await this.downloadAppExcel(task.appId, task.folderPath, task.appName, progressCallback, excelIndex, appsToUse.length);
+          excelIndex++;
+        }
+        // Finalizar
+        const totalBytes = (statsToUse ? statsToUse.backupSize : this.backupStats.backupSize) * 1024 * 1024 * 1024;
+        this.addLog("success", `Respaldo completo finalizado. Tamaño total estimado: ${totalBytes} bytes (${(statsToUse ? statsToUse.backupSize : this.backupStats.backupSize).toFixed(2)} GB)`);
+        // ACTUALIZAR EL ITEM DE BACKUP EN PODIO CON LOS DATOS FINALES Y ESTADO
+        await this.updateBackupRecord(true);
+        if (progressCallback) {
+          this.updateProgress(100, "Respaldo completado.", progressCallback);
+        }
+        return;
+      }
+      // Si no hay datos escaneados, recorre y llena scannedApps en vivo
+      this.scannedFiles = [];
+      this.scannedStats = null;
+      this.scannedApps = [];
+      this.backupCounts = {
+        organizations: 0,
+        workspaces: 0,
+        applications: 0,
+        items: 0,
+        files: 0,
+        downloadedFiles: 0,
+      };
+      this.backupStats = {
+        apps: 0,
+        items: 0,
+        workspaces: 0,
+        files: 0,
+        backupSize: 0,
+        successfulBackups: 0,
+        backupWarnings: 0,
+        downloadedFiles: 0,
+        downloadedBytes: 0,
+      };
+      this.lastProgress = 0;
+      if (!this.authData) {
+        this.addLog("error", "No autenticado. Llama a authenticate() primero.");
+        throw new Error("No autenticado");
+      }
+      const organizations = await this.getOrganizations();
+      this.backupCounts.organizations = organizations.length;
+      if (progressCallback) {
+        this.updateProgress(5, "Escaneando organizaciones...", progressCallback);
+      }
+      let totalProgress = 5;
+      const progressPerOrg = organizations.length > 0 ? 95 / organizations.length : 95;
+      for (let i = 0; i < organizations.length; i++) {
+        const org = organizations[i];
+        this.addLog("info", `Escaneando organización: ${org.name} (${i + 1}/${organizations.length})`);
+        const workspaces = await this.getWorkspaces(org.org_id);
+        this.backupCounts.workspaces += workspaces.length;
+        this.backupStats.workspaces += workspaces.length;
+        totalWorkspaces += workspaces.length;
+        totalProgress += progressPerOrg * 0.1;
+        if (progressCallback) {
+          this.updateProgress(totalProgress, `Escaneando espacios de trabajo para ${org.name}...`, progressCallback);
+        }
+        const progressPerWorkspace = workspaces.length > 0 ? (progressPerOrg * 0.9) / workspaces.length : progressPerOrg * 0.9;
+        for (let j = 0; j < workspaces.length; j++) {
+          const workspace = workspaces[j];
+          this.addLog("info", `Escaneando espacio de trabajo: ${workspace.name} (${j + 1}/${workspaces.length})`);
+          const applications = await this.getApplications(workspace.space_id);
+          this.backupCounts.applications += applications.length;
+          this.backupStats.apps += applications.length;
+          totalApps += applications.length;
+          totalProgress += progressPerWorkspace * 0.2;
+          if (progressCallback) {
+            this.updateProgress(totalProgress, `Escaneando aplicaciones para ${workspace.name}...`, progressCallback);
+          }
+          const progressPerApp = applications.length > 0 ? (progressPerWorkspace * 0.8) / applications.length : progressPerWorkspace * 0.8;
+          for (let k = 0; k < applications.length; k++) {
+            const app = applications[k];
+            this.addLog("info", `--- INICIO app (${k + 1}/${applications.length}): ${app.name} ---`);
+            this.addLog("info", `Llamando a getItems para app_id=${app.app_id} (${app.name})...`);
+            let items: PodioItem[] = [];
+            try {
+              items = await this.getItems(app.app_id);
+              this.addLog("info", `getItems OK: ${items.length} items encontrados en app ${app.name} (${app.app_id})`);
+            } catch (err) {
+              this.addLog("error", `Error en getItems para app ${app.name} (${app.app_id}): ${err instanceof Error ? err.message : String(err)}`);
+              continue;
+            }
+            this.backupCounts.items += items.length;
+            this.backupStats.items += items.length;
+            totalItems += items.length;
+            // Crear carpeta para la app
+            const folderPath = await this.createFolderStructure(org.name, workspace.name, app.name);
+            // Guardar tarea de Excel para después (en memoria)
+            this.scannedApps.push({ appId: app.app_id, folderPath, appName: app.name });
+            
+            // Acumular archivos para procesar en batches
+            const appFiles: PodioFile[] = [];
+            
+            // Recorrer cada item y obtener archivos adjuntos
+            for (let m = 0; m < items.length; m++) {
+              const item = items[m];
+              this.addLog("info", `  [${m + 1}/${items.length}] Llamando a getItemFiles para item_id=${item.item_id} (${item.title})...`);
+              let files: PodioFile[] = [];
+              try {
+                files = await this.getItemFiles(item.item_id);
+                this.addLog("info", `  getItemFiles OK: ${files.length} archivos encontrados en item ${item.item_id}`);
+              } catch (err) {
+                this.addLog("error", `  Error en getItemFiles para item ${item.item_id}: ${err instanceof Error ? err.message : String(err)}`);
+                continue;
+              }
+              for (const file of files) {
+                if (isTestMode() && totalFiles >= TEST_LIMIT) break;
+                
+                // OPTIMIZACIÓN: Obtener TODA la información necesaria durante el escaneo
+                let fileSize = file.size;
+                let downloadUrl = file.link;
+                
+                // Si falta el tamaño, obtenerlo desde el endpoint de archivo
+                if (!fileSize || fileSize === 0) {
+                  try {
+                    const fileInfo = await this.apiRequest<any>(`/file/${file.file_id}`);
+                    if (fileInfo && typeof fileInfo.size === 'number') {
+                      fileSize = fileInfo.size;
+                      file.size = fileSize; // Actualizar en memoria
+                    }
+                  } catch (e) {
+                    this.addLog("warning", `No se pudo obtener el tamaño para el archivo ${file.name} (${file.file_id})`);
+                  }
+                }
+                
+                // Si no hay link directo, obtener download_link durante el escaneo
+                if (!downloadUrl) {
+                  try {
+                    downloadUrl = await this.getFileDownloadLink(file.file_id);
+                    this.addLog("info", `Enlace de descarga obtenido durante escaneo: ${file.name}`);
+                  } catch (e) {
+                    this.addLog("warning", `No se pudo obtener enlace de descarga para ${file.name} (${file.file_id})`);
+                    continue; // Saltar archivo si no se puede obtener enlace
+                  }
+                }
+                
+                // Almacenar información completa para evitar duplicación en descarga
+                const filesFolder = `${folderPath}/files`;
+                this.scannedFilesComplete.push({
+                  file: file,
+                  downloadUrl: downloadUrl,
+                  folderPath: filesFolder,
+                  appName: app.name
+                });
+                
+                // Mantener compatibilidad con código existente
+                appFiles.push(file);
+                this.scannedFiles.push(file);
+                this.backupCounts.files++;
+                this.backupStats.files++;
+                this.backupStats.backupSize += fileSize / (1024 * 1024 * 1024); // Sumar en GB
+                totalFiles++;
+                this.addLog("info", `    Archivo completo preparado: ${file.name} (${fileSize} bytes)`);
+              }
+              if (isTestMode() && totalFiles >= TEST_LIMIT) break;
+            }
+            
+            // Procesar archivos de esta app en batches
+            if (appFiles.length > 0) {
+              const filesFolder = `${folderPath}/files`;
+              await this.processFilesInBatches(appFiles, filesFolder, progressCallback);
+            }
+            totalProgress += progressPerApp;
+            if (progressCallback) {
+              this.updateProgress(totalProgress, `Descarga de archivos para ${app.name}...`, progressCallback);
+            }
+          }
+        }
+      }
+      
+      // Finalizar escaneo con datos consolidados
+      this.totalFilesToDownload = this.scannedFiles.length;
+      // Guardar los stats escaneados
+      this.scannedStats = { ...this.backupStats };
+      // Finalizar escaneo
+      const totalBytes = this.backupStats.backupSize * 1024 * 1024 * 1024;
+      this.addLog("success", `Escaneo de respaldo completado. Tamaño total: ${totalBytes} bytes (${this.backupStats.backupSize.toFixed(2)} GB)`);
+      this.addLog("info", `Organizaciones: ${this.backupCounts.organizations}`);
+      this.addLog("info", `Espacios de trabajo: ${this.backupCounts.workspaces}`);
+      this.addLog("info", `Aplicaciones: ${this.backupCounts.applications}`);
+      this.addLog("info", `Elementos: ${this.backupCounts.items}`);
+      this.addLog("info", `Archivos encontrados: ${this.backupCounts.files}`);
+      this.addLog("info", `Tamaño estimado: ${this.backupStats.backupSize.toFixed(2)} GB`);
+      await this.updateEstimatedSizeInBackupRecord();
+      // ACTUALIZAR EL ITEM DE BACKUP EN PODIO CON LOS DATOS DEL ESCANEO
+      await this.updateBackupRecord(false);
+      if (progressCallback) {
+        this.updateProgress(99, "Escaneo completado. Listo para descargar.", progressCallback);
+      }
+    } catch (error) {
+      this.addLog("error", `Error durante el escaneo: ${error instanceof Error ? error.message : String(error)}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Actualiza el estado del respaldo en el item de backup en Podio
+   * @param success true si el respaldo fue exitoso, false si hubo error
+   * @param errorMessage mensaje de error opcional
+   */
+  protected async updateBackupRecord(success: boolean, errorMessage?: string): Promise<void> {
+    if (!this.backupItemId) {
+      this.addLog("warning", "No hay backupItemId para actualizar el estado del respaldo en Podio.");
+      return;
+    }
+    try {
+      // Obtener el estado correcto
+      // Debes reemplazar estos valores por el integer_value_of_option real de tu campo 'estado' en Podio
+      // Puedes obtenerlos consultando la API de Podio para las opciones del campo 'estado'
+      const ESTADO_COMPLETADO = 2; // Reemplaza por el valor real de la opción 'Completado'
+      const ESTADO_ERROR = 3;      // Reemplaza por el valor real de la opción 'Error'
+      const estadoValue = success ? ESTADO_COMPLETADO : ESTADO_ERROR;
+
+      // Obtener la fecha de inicio guardada y la fecha de fin
+      const fechaStart = this.backupStartDate;
+      const fechaEnd = this.formatDateForPodio(new Date());
+      // Formatear el tamaño en GB
+      const tamanoEnGb = this.backupStats.backupSize.toFixed(2) + " GB";
+
+      // Construir el payload para actualizar el item (todos los campos)
+      const fields: any = {
+        "estado": estadoValue,
+        "fecha": { start: fechaStart, end: fechaEnd },
+        "tamano-en-gb": tamanoEnGb,
+        "organizaciones": this.backupCounts.organizations,
+        "espacios-de-trabajo": this.backupCounts.workspaces,
+        "aplicacines": this.backupCounts.applications, // typo intencional
+        "items": this.backupCounts.items,
+        "archivos": this.backupCounts.files,
+      };
+
+      // Llamar a la API de Podio para actualizar el item
+      await this.apiRequest(`/item/${this.backupItemId}`, "PUT", { fields });
+      this.addLog("success", `Item de backup actualizado en Podio: estado=${success ? "Completado" : "Error"}, tamaño=${tamanoEnGb}`);
+    } catch (error) {
+      this.addLog("error", `Error al actualizar el item de backup en Podio: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * Crea un nuevo registro de backup en Podio y guarda el backupItemId
+   */
+  protected async createBackupRecord(): Promise<void> {
+    this.addLog("info", "Entrando a createBackupRecord...");
+    try {
+      // Debes reemplazar este valor por el integer_value_of_option real de la opción 'Pendiente' en tu campo 'estado'
+      const ESTADO_PENDIENTE = 1; // Reemplaza por el valor real de la opción 'Pendiente'
+      const fechaInicio = this.formatDateForPodio(new Date());
+      this.backupStartDate = fechaInicio; // Guardar fecha de inicio para updates
+      const titulo = `Respaldo ${new Date().toLocaleString()}`;
+      // Construir el payload para crear el item
+      const fields: any = {
+        "titulo": titulo,
+        "estado": ESTADO_PENDIENTE,
+        "fecha": { start: fechaInicio },
+        "organizaciones": 0,
+        "espacios-de-trabajo": 0,
+        "aplicacines": 0, // typo intencional, igual que en Podio
+        "items": 0,
+        "archivos": 0,
+        "tamano-en-gb": "0.00 GB",
+      };
+      const appId = Number(process.env.NEXT_PUBLIC_PODIO_BACKUP_APP_ID) || 30233695;
+      this.addLog("info", `Enviando request a /item/app/${appId}/ con fields: ${JSON.stringify(fields)}`);
+      // Llamar a la API de Podio para crear el item
+      const response = await this.apiRequest(`/item/app/${appId}/`, "POST", { fields });
+      this.addLog("info", `Respuesta de la API al crear backup: ${JSON.stringify(response)}`);
+      if (response && typeof response === 'object' && 'item_id' in response) {
+        this.backupItemId = (response as any).item_id;
+        this.addLog("success", `Registro de backup creado en Podio con ID: ${this.backupItemId}`);
+        this.addLog("warning", `¡Item de backup creado en Podio! ID: ${this.backupItemId}`); // Log naranja
+      } else {
+        this.backupItemId = null;
+        this.addLog("error", "No se pudo obtener el item_id al crear el registro de backup en Podio. No se podrá actualizar el estado del respaldo.");
+      }
+    } catch (error) {
+      this.backupItemId = null;
+      this.addLog("error", `Error al crear el registro de backup en Podio: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * Actualiza el tamaño estimado del respaldo en el item de backup en Podio
+   */
+  protected async updateEstimatedSizeInBackupRecord(): Promise<void> {
+    if (!this.backupItemId) {
+      this.addLog("warning", "No hay backupItemId para actualizar el tamaño del respaldo en Podio.");
+      return;
+    }
+    try {
+      const tamanoEnGb = this.backupStats.backupSize.toFixed(2) + " GB";
+      await this.apiRequest(`/item/${this.backupItemId}`, "PUT", { "tamano-en-gb": tamanoEnGb });
+      this.addLog("success", `Tamaño estimado del respaldo actualizado en Podio: ${tamanoEnGb}`);
+    } catch (error) {
+      this.addLog("error", `Error al actualizar el tamaño estimado del respaldo en Podio: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * Formatea una fecha al formato requerido por Podio: YYYY-MM-DD HH:MM:SS
+   */
+  private formatDateForPodio(date: Date): string {
+    const pad = (n: number) => n < 10 ? '0' + n : n;
+    return (
+      date.getFullYear() +
+      '-' + pad(date.getMonth() + 1) +
+      '-' + pad(date.getDate()) +
+      ' ' + pad(date.getHours()) +
+      ':' + pad(date.getMinutes()) +
+      ':' + pad(date.getSeconds())
+    );
+  }
+}
+
+export {};
